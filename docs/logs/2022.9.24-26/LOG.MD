@@ -23,12 +23,15 @@ Volume B: R存储相位函数g，G存储全局发光强度，B存储环境光强
 
 ### Rendering
 ![](rendering.png)
+
 体渲染由froxel和ray marching共同组成，近距离使用froxel，当距离超过阈值时，使用ray marchinging，但两者共用一套光照和数据模型。
 ![](sl.png)
+
 只考虑单次体积光的散射，这部分的L使用上述公式，涉及到了visibility、phase function和来自光源的luminance。这里提到的phase function的g项也是用到了henyey-greenstein，但是考虑到美术表现，g项的计算是通过加权blend的，美术可以调整g值达到不同的效果。关于visibility项，在寒霜里，需要用ray marching和clip map进行计算，这样对于局部的volume也可以表现出体积阴影，而在本文的分享中，不会考虑局部体积渲染造成的阴影，只考虑体积云造成的体积阴影。当然还有普通网格对象的阴影，其中terrian可以通过height map加速，它也讲到了局部多光源的阴影，这个之后再研究。
 terrain的shadow map可以通过从一个主光源开始使用height map进行ray marhcing得到，同样cloud的shadow map也类似，只不过后者需要累积其湮灭系数，也可以提前终止ray marching。
 
 ![](froxel.png)
+
 类似于froxel的做法，第一步首先求得每个格子的visibility项，然后填充每个格子的meterial属性，最后计算出每个格子到相机的散射光。
 
 

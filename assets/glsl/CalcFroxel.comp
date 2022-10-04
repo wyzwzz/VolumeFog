@@ -1,0 +1,11 @@
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler3D VBuffer0;
+layout(binding = 1) uniform sampler3D VBuffer1;
+
+
+void main(){
+
+}

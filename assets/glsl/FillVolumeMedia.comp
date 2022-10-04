@@ -1,0 +1,76 @@
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const int MaxLocalVolumeN = 16;
+
+struct GeometryInfoT{
+    vec3 low; int UID;
+    vec3 high; int pad;
+    mat4 model;
+};
+
+// intersect with frustum
+layout(binding = 0, std430) buffer IntersectVolumeUID{
+    int IntersectUID[];
+};
+
+shared GeometryInfoT S_GeometryInfo[MaxLocalVolumeN];
+shared int S_IntersectUID[MaxLocalVolumeN];
+
+const int VirtualTextureTileSize = 16;
+
+struct VirtualInfoT{
+    // one volume has two RGBA volume data
+    uvec4 origin0, origin1; // x y z k
+    uvec4 shape0, shape1; // w h d
+
+};
+
+layout(binding = 1, std430) buffer VirtualTextureTable{
+    VirtualInfoT VirtualInfo[];
+};
+
+const int MaxVirtualTextureN = 1;
+
+layout(binding = 0) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
+
+void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
+
+}
+
+bool Intersect(in vec3 pointPos, in vec3 aabbLow, in vec3 aabbHigh){
+
+    return true;
+}
+
+layout(binding = 0, rgba16f) uniform writeonly image3D VBuffer0;
+layout(binding = 1, rgba16f) uniform writeonly image3D VBuffer1;
+
+void main(){
+    int intersect_volume_count = IntersectUID[0];
+    for(int i = 0; i < intersect_volume_count; ++i){
+        S_IntersectUID[i] = IntersectUID[i + 1];
+    }
+
+    for(int z = 0; z < MaxSliceN; z++){
+
+        vec3 grid_center_pos;
+        vec4 vbuffer0, vbuffer1;
+        for(int i = 0; i < intersect_volume_count; ++i){
+                int UID = S_IntersectUID[i];
+                if(Intersect(grid_center_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
+                    // compute offset
+                    mat4 model = S_GeometryInfo[UID].model;
+                    vec3 offset = grid_center_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
+                    offset = vec3(model * vec4(offset, 0));
+                    offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
+                    // query for virtual texture
+
+                }
+        }
+
+    }
+
+
+}

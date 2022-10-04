@@ -1,0 +1,26 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const int ClipMapLevels = 5;
+
+layout(binding = 0) uniform writeonly image3D ClipMap[ClipMapLevels];
+
+struct AABB{
+    vec3 low;
+    vec3 high;
+};
+
+void main(){
+    vec3 last_clip_map_center;
+    // calc clip map center pos
+    vec3 clip_map_center;
+
+    for(int level = 0; level < ClipMapLevels; i++){
+        // get current clip map aabb of this level
+        AABB cur_level_aabb;
+        AABB pre_level_aabb;
+        // only update voxel in cur but not in pre
+
+    }
+
+}

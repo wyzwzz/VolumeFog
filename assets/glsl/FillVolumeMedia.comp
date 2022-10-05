@@ -31,9 +31,12 @@ layout(binding = 1, std430) buffer VirtualTextureTable{
     VirtualInfoT VirtualInfo[];
 };
 
+layout(binding = 0) uniform sampler2D GlobalFogTexture;
+// global origin and shape
+
 const int MaxVirtualTextureN = 1;
 
-layout(binding = 0) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
+layout(binding = 1) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
 
 void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
 

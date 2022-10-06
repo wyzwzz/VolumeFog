@@ -4,6 +4,7 @@
 #include <CGUtils/model.hpp>
 #include <CGUtils/image.hpp>
 using namespace wzz::model;
+using namespace wzz::math;
 using namespace wzz::gl;
 
 struct alignas(16) AtmosphereProperties {

@@ -17,4 +17,6 @@ add_executable(VolumeFog ${SRCS})
 
 target_link_libraries(VolumeFog PRIVATE CGUtils)
 
+target_include_directories(VolumeFog PRIVATE ext/cy)
+
 target_compile_features(VolumeFog PRIVATE cxx_std_20)

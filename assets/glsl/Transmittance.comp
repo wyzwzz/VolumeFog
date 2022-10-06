@@ -33,7 +33,7 @@ float SafeSqrt(float x){
 }
 
 vec3 GetSigmaT(float h){
-    vec3 rayleigh = RayleighScattering * exp(-h / rayleighDensityH);
+    vec3 rayleigh = RayleighScattering * exp(-h / RayleighDensityH);
     vec3 mie = vec3(MieScattering + MieAbsorption) * exp(-h / MieDensityH);
     vec3 ozone = OzoneAbsorption * max(0.0, 1 - abs(h - OzoneCenterH) / (OzoneWidth * 0.5));
     return rayleigh + mie + ozone;
@@ -51,7 +51,7 @@ bool FindClosestIntersectionWithCircle(vec2 o, vec2 d, float R, out float t){
 }
 
 // mapping form [0, 1] to [0.5 / n, 1 - 0.5 / n]
-float GetUnitRangeFromTextureCoord(float u, int texture_size){
+float GetUnitRangeFromTextureCoord(float x, int texture_size){
     return 0.5 / float(texture_size) + x * (1.0 - 1.0 / float(texture_size));
 }
 

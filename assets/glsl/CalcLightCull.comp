@@ -1,11 +1,15 @@
 #version 460 core
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 9, local_size_z = 1) in;
+
+// tile based because froxel is small
 
 // cull point light and spot light
 
 // max light count is 256
 // light index start and light count
-layout(binding = 0, rg8ui) uniform writeonly image3D LightIndexList;
+layout(binding = 0, rg8ui) uniform writeonly image2D LightIndexList;
+
+layout(binding = 0) uniform atomic_uint G_LightIndexCount;
 
 const uint MaxLightCount = 256;
 const uint MaxLightIndexTableSize = 1024;
@@ -16,7 +20,8 @@ layout(binding = 0, std430) buffer LightIndexTable{
 
 struct LocalLightT{
     vec3 center_pos;
-
+    int light_type;
+    float radius;
 };
 
 layout(binding = 1, std430) buffer LightArray{
@@ -24,7 +29,106 @@ layout(binding = 1, std430) buffer LightArray{
 };
 
 
+layout(binding = 0, std140) uniform PerFrameParams{
+    vec3 FrustumCorners[8];
+    int LightCount;
+};
+
+vec4 GetPlane(vec3 A, vec3 B, vec3 C){
+    vec3 normal = normalize(cross(B - A, C - A));
+    return vec4(normal, -dot(normal, A));
+}
+
+vec4 GetLightSphereRegion(in LocalLightT lightInfo){
+    if(light_type & 1){
+        // point light
+        return vec4(lightInfo.center_pos, lightInfo.radius);
+    }
+    else if(light_type & 2){
+        // spot light
+
+    }
+    return vec4(0);
+}
+
+bool SphereVisibilityAgainstPlane(in vec4 plane, in vec3 ballPos, float ballRadius){
+    float dist = dot(ballPos, plane.xyz) + plane.w;
+    return dist + ballRadius > 0.f;
+}
+
+bool Intersect(in vec3 frustumCorners[8], vec4 sphereRegion){
+    // simple judge and may return true even not intersect but this is ok
+    // near plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[0], frustumCorners[2], frustumCorners[1]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    // far plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[4], frustumCorners[5], frustumCorners[6]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    // left plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[0], frustumCorners[4], frustumCorners[2]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    // right plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[1], frustumCorners[3], frustumCorners[5]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    // top plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[2], frustumCorners[6], frustumCorners[3]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    // bottom plane
+    if(!SphereVisibilityAgainstPlane(GetPlane(frustumCorners[0], frustumCorners[1], frustumCorners[4]),
+        sphereRegion.xyz, sphereRegion.w))
+        return false;
+    return true;
+}
+
+
 
 void main(){
+    ivec2 g_index = ivec2(gl_WorkGroupSize.xy * gl_WorkGroupID.xy + gl_LocalInvocationID.xy);
+    ivec2 res = imageSize(LightIndexList);
+    if(g_index.x >= res.x || g_index.y >= res.y)
+        return;
 
+    float a0 = float(g_index.x) / float(res.x);
+    float a1 = float(g_index.x + 1) / float(res.x);
+    float b0 = float(g_index.y) / float(res.y);
+    float b1 = float(g_index.y + 1) / float(res.y);
+
+    vec3 frustum_corners[8];
+    vec3 x0 = mix(FrustumCorners[0], FrustumCorners[1], a0);
+    vec3 x1 = mix(FrustumCorners[0], FrustumCorners[1], a1);
+    vec3 x2 = mix(FrustumCorners[2], FrustumCorners[3], a0);
+    vec3 x3 = mix(FrustumCorners[2], FrustumCorners[3], a1);
+    frustum_corners[0] = mix(x0, x2, b0);
+    frustum_corners[1] = mix(x1, x3, b0);
+    frustum_corners[2] = mix(x0, x2, b1);
+    frustum_corners[3] = mix(x1, x3, b1);
+    vec3 x0 = mix(FrustumCorners[4], FrustumCorners[5], a0);
+    vec3 x1 = mix(FrustumCorners[4], FrustumCorners[5], a1);
+    vec3 x2 = mix(FrustumCorners[6], FrustumCorners[7], a0);
+    vec3 x3 = mix(FrustumCorners[6], FrustumCorners[7], a1);
+    frustum_corners[4] = mix(x0, x2, b0);
+    frustum_corners[5] = mix(x1, x3, b0);
+    frustum_corners[6] = mix(x0, x2, b1);
+    frustum_corners[7] = mix(x1, x3, b1);
+    int visible_light_indices[64];
+    int visible_light_count = 0;
+    //todo local lights in shared memory
+    for(int i = 0; i < LightCount; ++i){
+        if(Intersect(frustum_corners, GetLightSphereRegion(LocalLights[i]))){
+            visible_light_indices[visible_light_count++] = i;
+        }
+    }
+
+    barrier();
+
+    uint offset = atomicAdd(G_LightIndexCount, visible_light_count);
+    for(uint i = 0; i < visible_light_count; ++i){
+        LightIndex[offset + i] = visible_light_indices[i];
+    }
+    imageStore(LightIndexList, g_index, uvec2(offset, visible_light_count));
 }

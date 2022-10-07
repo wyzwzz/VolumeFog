@@ -3,9 +3,14 @@
 #include <CGUtils/api.hpp>
 #include <CGUtils/model.hpp>
 #include <CGUtils/image.hpp>
+#include <CGUtils/texture.hpp>
+#include <CGUtils/geometry.hpp>
+using namespace wzz::geometry;
+using namespace wzz::texture;
 using namespace wzz::model;
 using namespace wzz::math;
 using namespace wzz::gl;
+
 
 struct alignas(16) AtmosphereProperties {
     vec3f rayleigh_scattering = {5.802f, 13.558f, 33.1f};//10^(-6)m^(-1)

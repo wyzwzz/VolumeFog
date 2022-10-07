@@ -39,6 +39,14 @@ std::vector<vec2f> GetPoissonDiskSamples(int count) {
     return result;
 }
 
+namespace {
+
+    struct LocalVolumeResc{
+        
+    };
+
+
+}
 
 class TransmittanceGenerator{
   public:
@@ -336,8 +344,8 @@ class SkyViewRenderer{
 };
 
 
-//太阳光的shadow map，不用于spot light和point light
-class SunLightShadowRenderer{
+//太阳光或方向光的shadow map，不用于spot light和point light
+class DirectionalLightShadowRenderer{
   public:
     void initialize() {
 
@@ -356,6 +364,64 @@ class TerrainRenderer{
   private:
 
 };
+
+//每次只更新部分，第一次耗时较长
+class ClipMapGenerator{
+  public:
+    void initialize(float world_bound, float voxel_size, int lut_size) {
+        int level = 0;
+        float level_voxel_size =  voxel_size * (1 << level);
+        while(level_voxel_size < world_bound){
+            int level_lut_size = std::min<int>(lut_size, std::ceil(world_bound / level_voxel_size));
+            auto& clip_map = clip_maps.emplace_back(std::make_shared<texture3d_t>());
+            clip_map->initialize_handle();
+            clip_map->initialize_texture(1, GL_RGBA32F, level_lut_size, level_lut_size, level_lut_size);
+
+            level_voxel_size = voxel_size * (1 << ++level);
+        }
+        clip.world_bound = world_bound;
+        clip.voxel_size = voxel_size;
+        clip.levels = level;
+
+        c_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/ClipMap.comp"));
+
+    }
+
+    void generate(){
+
+    }
+    const std::vector<Ref<texture3d_t>>& getLUT(){
+        return clip_maps;
+    }
+  private:
+    program_t c_shader;
+    std::vector<Ref<texture3d_t>> clip_maps;
+
+    struct{
+        float world_bound;
+        float voxel_size;
+        int levels;
+    }clip;
+};
+
+//填充froxel属性并计算累积值 包括大气散射、局部雾和全局雾
+//体积阴影在mesh渲染处考虑，这里仅考虑体积自遮挡
+class AerialLUTGenerator{
+  public:
+    void initialize() {
+
+    }
+
+
+
+  private:
+    program_t c_fill_shader;
+    program_t c_calc_shader;
+
+};
+
+
 
 class VolumeRenderer : public gl_app_t{
 public:
@@ -458,11 +524,16 @@ private:
                 ImGui::TreePop();
             }
 
-
+            bool update_sun = false;
             if(ImGui::TreeNode("Sun")){
+                update_sun |= ImGui::SliderFloat("Sun X Degree", &sun_x_degree, 0, 360);
+                update_sun |= ImGui::SliderFloat("Sun Y Degree", &sun_y_degree, -10.f, 80);
+                update_sun |= ImGui::InputFloat("Sun Intensity", &sun_intensity);
+                update_sun |= ImGui::ColorEdit3("Sun Color", &sun_color.x);
 
                 ImGui::TreePop();
             }
+            update_sky_lut_params |= update_sun;
 
             if(update_sky_lut_params){
                 auto [sun_dir, _] = getSunLight();
@@ -477,7 +548,7 @@ private:
 
         // get intersected volume proxy aabb
 
-        sky_lut_generator.generate(camera.get_position(),
+        sky_lut_generator.generate(camera.get_position() * 50.f,
                                    trans_generator.getLUT(),
                                    multi_scat_generator.getLUT());
 

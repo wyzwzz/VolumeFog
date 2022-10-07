@@ -1,16 +1,33 @@
 #version 460 core
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
-const int ClipMapLevels = 5;
+const int MaxClipMapLevels = 6;
+//https://stackoverflow.com/questions/62031259/specifying-binding-for-texture-arrays-in-glsl
+layout(binding = 0) uniform writeonly image3D ClipMap[MaxClipMapLevels];
 
-layout(binding = 0) uniform writeonly image3D ClipMap[ClipMapLevels];
+layout(binding = 0, std140) uniform ClipMapParams{
+    int ClipMapLevels;
+    float ClipVoxelSize;
+};
+
 
 struct AABB{
     vec3 low;
     vec3 high;
 };
 
+// world bounds
+
+void UpdateClipMap(vec3 cur_clip_center, vec3 prev_clip_center){
+    for(int level = 0; level < ClipMapLevels; ++i){
+        int count = imageSize(ClipMap[level]).x;
+
+    }
+}
+
 void main(){
+
+
     vec3 last_clip_map_center;
     // calc clip map center pos
     vec3 clip_map_center;

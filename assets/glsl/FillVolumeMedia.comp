@@ -1,6 +1,6 @@
 #version 460 core
-
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+// 160 * 90 * 256
+layout(local_size_x = 8, local_size_y = 2, local_size_z = 64) in;
 
 const int MaxLocalVolumeN = 16;
 
@@ -22,8 +22,10 @@ const int VirtualTextureTileSize = 16;
 
 struct VirtualInfoT{
     // one volume has two RGBA volume data
-    uvec4 origin0, origin1; // x y z k
-    uvec4 shape0, shape1; // w h d
+    // volume 0 : scattering rgb and extinction
+    // volume 1 : emissive rgb and phase g
+    vec4 origin0, origin1; // x y z k
+    vec4 shape0, shape1; // w h d
 
 };
 
@@ -31,49 +33,89 @@ layout(binding = 1, std430) buffer VirtualTextureTable{
     VirtualInfoT VirtualInfo[];
 };
 
-layout(binding = 0) uniform sampler2D GlobalFogTexture;
+layout(binding = 0) uniform sampler2D GlobalFogTexture[2];
 // global origin and shape
 
-const int MaxVirtualTextureN = 1;
+const int MaxVirtualTextureN = 2;
 
-layout(binding = 1) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
+layout(binding = 2) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
+
+layout(binding = 0) uniform Params{
+    vec3 WorldOrigin;
+    int MaxSliceN;
+    vec3 WorldShape;
+    vec3 InvVirtualTextureShape;
+};
+
+void SampleGlobalVolume(in vec3 world_pos, out vec4 rgba0, out vec4 rgba1){
+    vec3 sample_pos = (world_pos - WorldOrigin) / WorldShape;
+    // todo density remap with noise?
+
+    rgba0 = vec4(0);
+    rgba1 = vec4(0);
+}
 
 void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
+    VirtualInfoT virtual_info = VirtualInfo[UID];
+    int k = int(virtual_info.origin0.w);
+    vec3 sample_pos = (origin0.xyz + offset * shape0.xyz) * InvVirtualTextureShape;
+    rgba0 = texture(VirtualTextures[k], sample_pos).rgba;
 
+    k = int(virtual_info.origin1.w);
+    sample_pos = (origin1.xyz + offset * shape1.xyz) * InvVirtualTextureShape;
+    rgba1 = texture(VirtualTextures[k],  sample_pos).rgba;
 }
 
 bool Intersect(in vec3 pointPos, in vec3 aabbLow, in vec3 aabbHigh){
-
-    return true;
+    return pointPos.x >= aabbLow.x && pointPos.x <= aabbHigh.x
+        && pointPos.y >= aabbLow.y && pointPos.y <= aabbHigh.y
+        && pointPos.z >= aabbLow.z && pointPos.z <= aabbHigh.z;
 }
 
-layout(binding = 0, rgba16f) uniform writeonly image3D VBuffer0;
-layout(binding = 1, rgba16f) uniform writeonly image3D VBuffer1;
+//readwrite
+layout(binding = 0, rgba16f) uniform image3D VBuffer0;
+layout(binding = 1, rgba16f) uniform image3D VBuffer1;
 
 void main(){
+    // todo imageSize bug?
+    ivec3 res = imageSize(VBuffer0);
+    ivec3 g_index = ivec3(gl_WorkGroupSize.xyz * gl_WorkGroupID.xyz + gl_LocalInvocationID.xyz);
+    if(g_index.x >= res.x || g_index.y >= res.y || g_index.z >= res.z)
+        return;
+
+
     int intersect_volume_count = IntersectUID[0];
     for(int i = 0; i < intersect_volume_count; ++i){
         S_IntersectUID[i] = IntersectUID[i + 1];
     }
 
     for(int z = 0; z < MaxSliceN; z++){
-
-        vec3 grid_center_pos;
+        //todo center + jitter + re-project and temporal blend
+        vec3 grid_sample_pos;
         vec4 vbuffer0, vbuffer1;
+        vec4 rgba0, rgba1;
+        // local volume
         for(int i = 0; i < intersect_volume_count; ++i){
                 int UID = S_IntersectUID[i];
-                if(Intersect(grid_center_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
+                if(Intersect(grid_sample_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
                     // compute offset
                     mat4 model = S_GeometryInfo[UID].model;
-                    vec3 offset = grid_center_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
+                    vec3 offset = grid_sample_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
                     offset = vec3(model * vec4(offset, 0));
                     offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
                     // query for virtual texture
-
+                    VirtualSample(UID, offset, rgba0, rgba1);
+                    vbuffer0 += rgba0;
+                    vbuffer1 += rgba1;
                 }
         }
+        // global volume
+        SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
+        vbuffer0 += rgba0;
+        vbuffer1 += rgba1;
 
+        imageStore(VBuffer0, g_index, rgba0);
+        imageStore(VBuffer1, g_index, rgba1);
     }
-
 
 }

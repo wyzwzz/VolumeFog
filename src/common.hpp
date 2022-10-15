@@ -8,8 +8,11 @@
 using namespace wzz::geometry;
 using namespace wzz::texture;
 using namespace wzz::model;
+using namespace wzz::image;
 using namespace wzz::math;
 using namespace wzz::gl;
+
+
 
 
 struct alignas(16) AtmosphereProperties {

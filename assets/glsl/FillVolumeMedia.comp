@@ -2,7 +2,7 @@
 // 160 * 90 * 256
 layout(local_size_x = 8, local_size_y = 2, local_size_z = 64) in;
 
-const int MaxLocalVolumeN = 16;
+const int MaxLocalVolumeN = 15;
 
 struct GeometryInfoT{
     vec3 low; int UID;
@@ -12,6 +12,9 @@ struct GeometryInfoT{
 
 // intersect with frustum
 layout(binding = 0, std430) buffer IntersectVolumeUID{
+    // 0 store count
+    // size = MaxLocalVolumeN + 1
+    // data from 1 to count
     int IntersectUID[];
 };
 

@@ -3,6 +3,21 @@
 #include <cyPoint.h>
 #include <cySampleElim.h>
 
+/**
+ * @param BA vertex B' pos minus vertex A' pos
+ */
+inline vec3f ComputeTangent(const vec3f &BA, const vec3f CA,
+                            const vec2f &uvBA, const vec2f &uvCA,
+                            const vec3f &normal) {
+    const float m00 = uvBA.x, m01 = uvBA.y;
+    const float m10 = uvCA.x, m11 = uvCA.y;
+    const float det = m00 * m11 - m01 * m10;
+    if (std::abs(det) < 0.0001f)
+        return wzz::math::tcoord3<float>::from_z(normal).x;
+    const float inv_det = 1 / det;
+    return (m11 * inv_det * BA - m01 * inv_det * CA).normalized();
+}
+
 inline vec3i GetGroupSize(int x, int y = 1, int z = 1) {
     constexpr int group_thread_size_x = 16;
     constexpr int group_thread_size_y = 16;
@@ -12,6 +27,37 @@ inline vec3i GetGroupSize(int x, int y = 1, int z = 1) {
     const int group_size_z = (z + group_thread_size_z - 1) / group_thread_size_z;
     return {group_size_x, group_size_y, group_size_z};
 }
+template<GLint filter, GLint wrap>
+struct GLSampler{
+    inline static sampler_t sampler;
+    static void Init(){
+        sampler.initialize_handle();
+        sampler.set_param(GL_TEXTURE_MIN_FILTER, filter);
+        sampler.set_param(GL_TEXTURE_MAG_FILTER, filter);
+        sampler.set_param(GL_TEXTURE_WRAP_S, wrap);
+        sampler.set_param(GL_TEXTURE_WRAP_T, wrap);
+        sampler.set_param(GL_TEXTURE_WRAP_R, wrap);
+    }
+    static void Bind(GLuint binding) {
+        sampler.bind(binding);
+    }
+    static void UnBind(GLuint binding){
+        sampler.unbind(binding);
+    }
+};
+
+using GL_LinearClampSampler = GLSampler<GL_LINEAR, GL_CLAMP_TO_EDGE>;
+using GL_LinearRepeatSampler = GLSampler<GL_LINEAR, GL_REPEAT>;
+using GL_NearestClampSampler = GLSampler<GL_NEAREST, GL_CLAMP_TO_EDGE>;
+using GL_NearestRepeatSampler = GLSampler<GL_NEAREST, GL_REPEAT>;
+
+void InitAllSampler(){
+    GL_LinearClampSampler::Init();
+    GL_LinearRepeatSampler::Init();
+    GL_NearestClampSampler::Init();
+    GL_NearestRepeatSampler::Init();
+}
+
 
 std::vector<vec2f> GetPoissonDiskSamples(int count) {
     std::default_random_engine rng{std::random_device()()};
@@ -39,14 +85,26 @@ std::vector<vec2f> GetPoissonDiskSamples(int count) {
     return result;
 }
 
-namespace {
 
-    struct LocalVolumeResc{
-        
-    };
+struct LocalVolumeGeometryInfo{
+    vec3f low; int uid;
+    vec3f high; int pad;
+    mat4 model;// not consider rotate current so it's just AABB now
+};
 
+struct LocalVolumeCube : public LocalVolumeGeometryInfo{
+    vertex_array_t vao;
+    vertex_buffer_t<vec3f> vbo;// line mode for debug
+};
 
-}
+struct LocalVolume{
+    std::string desc_name;
+    LocalVolumeGeometryInfo info;
+
+    image3d_t<vec4f> vbuffer0;
+    image3d_t<vec4f> vbuffer1;
+};
+
 
 class TransmittanceGenerator{
   public:
@@ -345,24 +403,173 @@ class SkyViewRenderer{
 
 
 //太阳光或方向光的shadow map，不用于spot light和point light
-class DirectionalLightShadowRenderer{
+class DirectionalLightShadowGenerator{
   public:
     void initialize() {
+        shader = program_t::build_from(
+            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/ShadowMap.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/ShadowMap.frag"));
 
+        fbo.initialize_handle();
+        rbo.initialize_handle();
+        rbo.set_format(GL_DEPTH32F_STENCIL8, ShadowMapSizeX, ShadowMapSizeY);
+        fbo.attach(GL_DEPTH_STENCIL_ATTACHMENT, rbo);
+        shadow = newRef<texture2d_t>();
+        shadow->initialize_handle();
+        shadow->initialize_texture(1, GL_R32F, ShadowMapSizeX, ShadowMapSizeY);
+        fbo.attach(GL_COLOR_ATTACHMENT0, *shadow);
+        assert(fbo.is_complete());
+
+        transform_buffer.initialize_handle();
+        transform_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+    }
+
+    void begin(){
+        shader.bind();
+        fbo.bind();
+        GL_EXPR(glViewport(0, 0, ShadowMapSizeX, ShadowMapSizeY));
+        GL_EXPR(glDrawBuffer(GL_COLOR_ATTACHMENT0));
+        fbo.clear_color_depth_buffer();
+    }
+
+    void generate(const vertex_array_t& vao, int count,
+              const mat4& model, const mat4& proj_view){
+        transform.model = model;
+        transform.mvp = proj_view * model;
+        transform_buffer.set_buffer_data(&transform);
+        transform_buffer.bind(0);
+
+        vao.bind();
+        GL_EXPR(glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, nullptr));
+        vao.unbind();
+    }
+
+    void end(){
+        fbo.unbind();
+        shader.unbind();
+    }
+
+    Ref<texture2d_t> getShadowMap() const {
+        return shadow;
     }
 
   private:
+    program_t shader;
+    static constexpr int ShadowMapSizeX = 4096;
+    static constexpr int ShadowMapSizeY = 4096;
+    struct{
+        framebuffer_t fbo;
+        renderbuffer_t rbo;
+        Ref<texture2d_t> shadow;
+    };
+    struct Transform{
+        mat4 model;
+        mat4 mvp;
+    }transform;
+    std140_uniform_block_buffer_t<Transform> transform_buffer;
 
 };
 
+class GBufferGenerator{
+  public:
+    void initialize(){
+        shader = program_t::build_from(
+            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/GBuffer.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/GBuffer.frag"));
+
+        gbuffer0 = newRef<texture2d_t>();
+        gbuffer1 = newRef<texture2d_t>();
+
+        transform_buffer.initialize_handle();
+        transform_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+    }
+
+    void resize(const vec2i& res){
+        if(res == gbuffer_res) return;
+        gbuffer_res = res;
+
+        gbuffer0->destroy();
+        gbuffer0->initialize_handle();
+        gbuffer0->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+
+        gbuffer1->destroy();
+        gbuffer1->initialize_handle();
+        gbuffer1->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+    }
+
+    void begin(){
+        shader.bind();
+        fbo.bind();
+        GL_EXPR(glViewport(0, 0, gbuffer_res.x, gbuffer_res.y));
+        static GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+        GL_EXPR(glDrawBuffers(2, draw_buffers));
+        fbo.clear_color_depth_buffer();
+    }
+
+    void draw(const vertex_array_t& vao, int count,
+              const mat4& model, const mat4& view, const mat4& proj,
+              const Ref<texture2d_t>& albedo_map,
+              const Ref<texture2d_t>& normal_map){
+        transform.model = model;
+        transform.view_model = view * model;
+        transform.mvp = proj * transform.view_model;
+        transform_buffer.set_buffer_data(&transform);
+        transform_buffer.bind(0);
+
+        albedo_map->bind(0);
+        normal_map->bind(1);
+
+        vao.bind();
+        GL_EXPR(glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, nullptr));
+        vao.unbind();
+    }
+
+    void end(){
+        fbo.unbind();
+        shader.unbind();
+    }
+
+    auto getGBuffer() const {
+        return std::make_pair(gbuffer0, gbuffer1);
+    }
+
+  private:
+    program_t shader;
+    struct{
+        // compress, pos(3) + normal(2) + albedo(2) + depth(1) = 2 * rgba
+        Ref<texture2d_t> gbuffer0;
+        Ref<texture2d_t> gbuffer1;
+        vec2i gbuffer_res;
+
+        framebuffer_t fbo;
+        renderbuffer_t rbo;
+    };
+    struct Transform{
+        mat4 model;
+        mat4 view_model;
+        mat4 mvp;
+    }transform;
+    std140_uniform_block_buffer_t<Transform> transform_buffer;
+};
+
+// tile based defer render
 class TerrainRenderer{
   public:
     void initialize() {
+        shader = program_t::build_from(
+            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/Terrain.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/Terrain.frag"));
+
+    }
+
+    // using default framebuffer
+    void render(const Ref<texture2d_t>& gbuffer0,
+                const Ref<texture2d_t>& gbuffer1){
 
     }
 
   private:
-
+    program_t shader;
 };
 
 //每次只更新部分，第一次耗时较长
@@ -411,17 +618,99 @@ class AerialLUTGenerator{
   public:
     void initialize() {
 
+        vbuffer0 = newRef<texture3d_t>();
+        vbuffer1 = newRef<texture3d_t>();
+
+
+        intersect_vol_uid_buffer.initialize_handle();
+        intersect_vol_uid_buffer.initialize_buffer_data(nullptr, MaxLocalVolumeN + 1, GL_DYNAMIC_STORAGE_BIT);
+    }
+    void resize(const vec3i& res){
+        if(res == vbuffer_res) return;
+        vbuffer_res = res;
+        vbuffer0->destroy();
+        vbuffer1->destroy();
+
+        vbuffer0->initialize_handle();
+        vbuffer0->initialize_texture(1, GL_RGBA16F, res.x, res.y, res.z);
+
+        vbuffer1->initialize_handle();
+        vbuffer1->initialize_texture(1, GL_RGBA16F, res.x, res.y, res.z);
+
+    }
+
+    void prepare(const mat4& proj_view, const std::vector<Ref<LocalVolume>>& local_volumes){
+        frustum_extf camera_frustum;
+        extract_frustum_from_matrix(proj_view, camera_frustum, true);
+        std::vector<int> view_volumes(1);
+        for(auto& local_volume : local_volumes){
+            auto box = aabb3f(local_volume->info.low, local_volume->info.high);
+            if(get_box_visibility(camera_frustum, box) != BoxVisibility::Invisible){
+                view_volumes.push_back(local_volume->info.uid);
+            }
+        }
+        view_volumes[0] = view_volumes.size() - 1;
+        intersect_vol_uid_buffer.set_buffer_data(view_volumes.data(), 0, view_volumes.size() * sizeof(int));
+        LOG_DEBUG("camera view local volume count : ", view_volumes[0]);
+
+
+
+    }
+
+    void generate(){
+
     }
 
 
+    auto getLUT() const{
+        return std::make_pair(vbuffer0, vbuffer1);
+    }
 
   private:
     program_t c_fill_shader;
     program_t c_calc_shader;
 
+    static constexpr int MaxLocalVolumeN = 15;
+
+    // volume uid that intersect with camera frustum
+    storage_buffer_t<int> intersect_vol_uid_buffer;
+
+
+    Ref<texture3d_t> vbuffer0;
+    Ref<texture3d_t> vbuffer1;
+    vec3i vbuffer_res;
 };
 
+class PostProcessRenderer{
+  public:
+    void initialize() {
+        shader = program_t::build_from(
+            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/Quad.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/PostProcess.frag"));
 
+        vao.initialize_handle();
+    }
+
+    // must bind to default framebuffer first
+    void draw(const Ref<texture2d_t>& color){
+        shader.bind();
+        vao.bind();
+
+        color->bind(0);
+        GL_NearestRepeatSampler::Bind(0);
+
+        GL_EXPR(glDepthFunc(GL_LEQUAL));
+        GL_EXPR(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+        GL_EXPR(glDepthFunc(GL_LESS));
+
+        vao.unbind();
+        shader.unbind();
+    }
+
+  private:
+    program_t shader;
+    vertex_array_t vao;
+};
 
 class VolumeRenderer : public gl_app_t{
 public:
@@ -435,6 +724,21 @@ private:
         GL_EXPR(glEnable(GL_DEPTH_TEST));
         GL_EXPR(glClearColor(0, 0, 0, 0));
         GL_EXPR(glClearDepth(1.0));
+
+        InitAllSampler();
+
+        loadTerrain(mat4::identity(), "assets/terrain.obj", "", "assets/normal.jpg");
+
+        auto [window_w, window_h] = window->get_window_size();
+
+        offscreen_frame.fbo.initialize_handle();
+        offscreen_frame.rbo.initialize_handle();
+        offscreen_frame.rbo.set_format(GL_DEPTH32F_STENCIL8, window_w, window_h);
+        offscreen_frame.fbo.attach(GL_DEPTH_STENCIL_ATTACHMENT, offscreen_frame.rbo);
+        offscreen_frame.color = newRef<texture2d_t>();
+        offscreen_frame.color->initialize_handle();
+        offscreen_frame.color->initialize_texture(1, GL_RGBA8, window_w, window_h);
+        assert(offscreen_frame.fbo.is_complete());
 
         std_unit_atmos_prop = preset_atmos_prop.toStdUnit();
         trans_generator.initialize();
@@ -454,11 +758,42 @@ private:
         sky_view_renderer.initialize();
         sky_view_renderer.update(exposure, window->get_window_w_over_h());
 
+        aerial_lut_generator.initialize();
+        aerial_lut_generator.resize(aerial_lut_res);
+
+        gbuffer_generator.initialize();
+        gbuffer_generator.resize(window->get_window_size());
+
+        dl_shadow_generator.initialize();
+
+        terrain_renderer.initialize();
+
+
+        post_process_renderer.initialize();
+
         //camera
         camera.set_position({4.087f, 26.7f, 3.957f});
         camera.set_perspective(CameraFovDegree, 0.1f, 100.f);
         camera.set_direction(0, 0.12);
 
+        // init test local volume
+        {
+            local_volume_test.vol0->desc_name = "test_local_volume0";
+            local_volume_test.vol0->info.low = vec3f(0.f, 0.f, 0.f);
+            local_volume_test.vol0->info.high = vec3f(1.f, 1.f, 1.f);
+            local_volume_test.vol0->info.uid = 1;
+            local_volume_test.vol0->info.model = mat4::identity();
+            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(1.f, 1.f, 0.f, 1.f));
+
+
+            local_volume_test.vol1->desc_name = "test_local_volume1";
+            local_volume_test.vol1->info.low = vec3f(1.5f, 0.f, 0.f);
+            local_volume_test.vol1->info.high = vec3f(2.5f, 1.f, 1.f);
+            local_volume_test.vol1->info.uid = 2;
+            local_volume_test.vol1->info.model = mat4::identity();
+
+
+        }
     }
 
 	void frame() override {
@@ -545,8 +880,49 @@ private:
 
 
         // get camera frustum
-
+        auto camera_proj_view = camera.get_view_proj();
+        auto camera_view = camera.get_view();
+        auto camera_proj = camera.get_proj();
         // get intersected volume proxy aabb
+
+        // render test local volume
+        {
+            std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1};
+            aerial_lut_generator.prepare(camera_proj_view, visible_local_volumes);
+
+            aerial_lut_generator.generate();
+
+
+        }
+
+        auto [sun_dir, sun_proj_view] = getSunLight();
+
+        // shadow map
+
+        dl_shadow_generator.begin();
+        for(auto& mesh : terrain_meshes){
+            dl_shadow_generator.generate(mesh->vao, mesh->ebo.index_count(),
+                                         mesh->t, sun_proj_view);
+        }
+        dl_shadow_generator.end();
+
+        // render terrian
+
+        gbuffer_generator.begin();
+        for(auto& mesh : terrain_meshes){
+            gbuffer_generator.draw(mesh->vao, mesh->ebo.index_count(),
+                                   mesh->t, camera_view, camera_proj,
+                                   mesh->albedo_map, mesh->normal_map);
+        }
+        gbuffer_generator.end();
+        auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
+
+
+        // todo
+        bindToOffScreenFrame(true);
+        terrain_renderer.render(gbuffer0, gbuffer1);
+
+
 
         sky_lut_generator.generate(camera.get_position() * 50.f,
                                    trans_generator.getLUT(),
@@ -556,14 +932,18 @@ private:
         auto camera_dir = camera.get_xyz_direction();
         const vec3f world_up = {0.f, 1.f, 0.f};
 
-        framebuffer_t::bind_to_default();
-        framebuffer_t::clear_color_depth_buffer();
+//        framebuffer_t::bind_to_default();
+//        framebuffer_t::clear_color_depth_buffer();
+        bindToOffScreenFrame();
         GL_EXPR(glViewport(0, 0, window->get_window_width(), window->get_window_height()));
 
         sky_view_renderer.render(camera_dir, cross(camera_dir, world_up).normalized(), deg2rad(CameraFovDegree),
                                  sky_lut_generator.getLUT());
 
 
+        framebuffer_t::bind_to_default();
+        framebuffer_t::clear_color_depth_buffer();
+        post_process_renderer.draw(offscreen_frame.color);
 
         ImGui::End();
         ImGui::PopStyleVar();
@@ -578,8 +958,61 @@ private:
 
     }
 
-    void loadTerrain(){
+    void loadTerrain(const mat4& local_to_world, std::string filename, std::string albedo_filename = "", std::string normal_filename = ""){
+        auto model = load_model_from_file(filename);
+        image2d_t<color3b> albedo = albedo_filename.empty() ? image2d_t<color3b>(2, 2, to_color3b(color3f(0.3f))) : image2d_t<color3b>(load_rgb_from_file(albedo_filename));
+        image2d_t<color3b> normal = normal_filename.empty() ? image2d_t<color3b>(2, 2, to_color3b(color3f(0.5f, 0.5f, 1.f))) : image2d_t<color3b>(load_rgb_from_file(normal_filename));
 
+        auto albedo_map = newRef<texture2d_t>();
+        albedo_map->initialize_handle();
+        albedo_map->initialize_format_and_data(1, GL_RGB8, albedo);
+        auto normal_map = newRef<texture2d_t>();
+        normal_map->initialize_handle();
+        normal_map->initialize_format_and_data(1, GL_RGB8, normal);
+        for(auto& mesh : model->meshes){
+            auto& draw_mesh = terrain_meshes.emplace_back(newRef<DrawMesh>());
+            // todo
+            draw_mesh->albedo_map = albedo_map;
+            draw_mesh->normal_map = normal_map;
+
+            draw_mesh->t = local_to_world;
+
+            draw_mesh->vao.initialize_handle();
+            draw_mesh->vbo.initialize_handle();
+            draw_mesh->ebo.initialize_handle();
+
+            std::vector<Vertex> vertices;
+            int n = mesh.indices.size() / 3;
+            auto &indices = mesh.indices;
+            vertices.reserve(mesh.vertices.size());
+            for (int i = 0; i < n; i++) {
+                const auto &A = mesh.vertices[indices[3 * i]];
+                const auto &B = mesh.vertices[indices[3 * i + 1]];
+                const auto &C = mesh.vertices[indices[3 * i + 2]];
+                const auto BA = B.pos - A.pos;
+                const auto CA = C.pos - A.pos;
+                const auto uvBA = B.tex_coord - A.tex_coord;
+                const auto uvCA = C.tex_coord - A.tex_coord;
+                for (int j = 0; j < 3; j++) {
+                    const auto &v = mesh.vertices[indices[3 * i + j]];
+                    vertices.push_back({
+                        v.pos, v.normal, ComputeTangent(BA, CA, uvBA, uvCA, v.normal),
+                        v.tex_coord});
+                }
+            }
+            assert(vertices.size() == mesh.vertices.size());
+            draw_mesh->vbo.reinitialize_buffer_data(vertices.data(), vertices.size(), GL_STATIC_DRAW);
+            draw_mesh->ebo.reinitialize_buffer_data(indices.data(), indices.size(), GL_STATIC_DRAW);
+            draw_mesh->vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec3f>(0), draw_mesh->vbo, &Vertex::pos, 0);
+            draw_mesh->vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec3f>(1), draw_mesh->vbo, &Vertex::normal, 1);
+            draw_mesh->vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec3f>(2), draw_mesh->vbo, &Vertex::tangent, 2);
+            draw_mesh->vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec2f>(3), draw_mesh->vbo, &Vertex::tex_coord,3);
+            draw_mesh->vao.enable_attrib(attrib_var_t<vec3f>(0));
+            draw_mesh->vao.enable_attrib(attrib_var_t<vec3f>(1));
+            draw_mesh->vao.enable_attrib(attrib_var_t<vec3f>(2));
+            draw_mesh->vao.enable_attrib(attrib_var_t<vec2f>(3));
+            draw_mesh->vao.bind_index_buffer(draw_mesh->ebo);
+        }
     }
 
     std::tuple<vec3f, mat4> getSunLight() {
@@ -593,7 +1026,13 @@ private:
         auto proj = transform::orthographic(-50.f, 50.f, -50.f, 50.f, 1.f, 200.f);
         return std::make_tuple(-sun_dir, proj * view);
     }
-
+    void bindToOffScreenFrame(bool clear = false){
+        offscreen_frame.fbo.bind();
+        GL_EXPR(glViewport(0, 0, window->get_window_width(), window->get_window_height()));
+        if(clear){
+            GL_EXPR(glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT));
+        }
+    }
 private:
     // local volume fog
     struct VirtualTexture{
@@ -610,17 +1049,34 @@ private:
 
     // scene
     // terrain
+    struct Vertex{
+        vec3f pos;
+        vec3f normal;
+        vec3f tangent;
+        vec2f tex_coord;
+    };
     struct DrawMesh{
         vertex_array_t vao;
-        vertex_buffer_t<vertex_t> vbo;
+        vertex_buffer_t<Vertex> vbo;
         index_buffer_t<uint32_t> ebo;
+        Ref<texture2d_t> albedo_map;
+        Ref<texture2d_t> normal_map;
         mat4 t;
     };
     std::vector<Ref<DrawMesh>> terrain_meshes;
+    Ref<texture2d_t> terrain_albedo_map;
+    Ref<texture2d_t> terrain_normal_map;
 
     AtmosphereProperties preset_atmos_prop;
     AtmosphereProperties std_unit_atmos_prop;
 
+
+    // render to off-screen framebuffer before finally post-process
+    struct{
+        framebuffer_t fbo;
+        renderbuffer_t rbo;
+        Ref<texture2d_t> color;
+    }offscreen_frame;
 
     TransmittanceGenerator trans_generator;
     vec2i trans_lut_res{1024, 256};
@@ -635,11 +1091,31 @@ private:
 
     SkyViewRenderer sky_view_renderer;
 
+    AerialLUTGenerator aerial_lut_generator;
+    vec3i aerial_lut_res = {200, 150, 32};
+
+    GBufferGenerator gbuffer_generator;
+
+    DirectionalLightShadowGenerator dl_shadow_generator;
+
+    TerrainRenderer terrain_renderer;
+
+
+
+    PostProcessRenderer post_process_renderer;
+
     static constexpr float CameraFovDegree = 60.f;
 
     bool vsync = true;
 
     float exposure = 10.f;
+
+
+    // test and debug
+    struct {
+        Ref<LocalVolume> vol0;
+        Ref<LocalVolume> vol1;
+    }local_volume_test;
 
 };
 

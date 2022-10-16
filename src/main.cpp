@@ -44,6 +44,9 @@ struct GLSampler{
     static void UnBind(GLuint binding){
         sampler.unbind(binding);
     }
+    static void Destroy(){
+        sampler.destroy();
+    }
 };
 
 using GL_LinearClampSampler = GLSampler<GL_LINEAR, GL_CLAMP_TO_EDGE>;
@@ -56,6 +59,13 @@ void InitAllSampler(){
     GL_LinearRepeatSampler::Init();
     GL_NearestClampSampler::Init();
     GL_NearestRepeatSampler::Init();
+}
+
+void DestroyAllSampler(){
+    GL_LinearClampSampler::Destroy();
+    GL_LinearRepeatSampler::Destroy();
+    GL_NearestClampSampler::Destroy();
+    GL_NearestRepeatSampler::Destroy();
 }
 
 
@@ -341,12 +351,12 @@ class SkyViewRenderer{
         sky_view_per_frame_params_buffer.initialize_handle();
         sky_view_per_frame_params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
 
-        linear_clamp_sampler.initialize_handle();
-        linear_clamp_sampler.set_param(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        linear_clamp_sampler.set_param(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+//        linear_clamp_sampler.initialize_handle();
+//        linear_clamp_sampler.set_param(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+//        linear_clamp_sampler.set_param(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
 
     }
@@ -369,7 +379,8 @@ class SkyViewRenderer{
         sky_view_per_frame_params_buffer.bind(1);
         // texture
         sky_lut->bind(0);
-        linear_clamp_sampler.bind(0);
+//        linear_clamp_sampler.bind(0);
+        GL_LinearClampSampler::Bind(0);
 
         shader.bind();
         quad_vao.bind();
@@ -398,7 +409,7 @@ class SkyViewRenderer{
     program_t shader;
     vertex_array_t quad_vao;
 
-    sampler_t linear_clamp_sampler;
+//    sampler_t linear_clamp_sampler;
 };
 
 
@@ -407,8 +418,8 @@ class DirectionalLightShadowGenerator{
   public:
     void initialize() {
         shader = program_t::build_from(
-            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/ShadowMap.vert"),
-            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/ShadowMap.frag"));
+            shader_t<GL_VERTEX_SHADER>::from_file("assets/glsl/ShadowMap.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/ShadowMap.frag"));
 
         fbo.initialize_handle();
         rbo.initialize_handle();
@@ -474,14 +485,15 @@ class GBufferGenerator{
   public:
     void initialize(){
         shader = program_t::build_from(
-            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/GBuffer.vert"),
-            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/GBuffer.frag"));
+            shader_t<GL_VERTEX_SHADER>::from_file("assets/glsl/GBuffer.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/GBuffer.frag"));
 
         gbuffer0 = newRef<texture2d_t>();
         gbuffer1 = newRef<texture2d_t>();
 
         transform_buffer.initialize_handle();
         transform_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+
     }
 
     void resize(const vec2i& res){
@@ -495,6 +507,15 @@ class GBufferGenerator{
         gbuffer1->destroy();
         gbuffer1->initialize_handle();
         gbuffer1->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+
+        {
+            fbo.initialize_handle();
+            rbo.initialize_handle();
+            rbo.set_format(GL_DEPTH32F_STENCIL8, res.x, res.y);
+            fbo.attach(GL_DEPTH_STENCIL_ATTACHMENT, rbo);
+            fbo.attach(GL_COLOR_ATTACHMENT0, *gbuffer0);
+            fbo.attach(GL_COLOR_ATTACHMENT1, *gbuffer1);
+        }
     }
 
     void begin(){
@@ -557,19 +578,87 @@ class TerrainRenderer{
   public:
     void initialize() {
         shader = program_t::build_from(
-            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/Terrain.vert"),
-            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/Terrain.frag"));
+            shader_t<GL_VERTEX_SHADER>::from_file("assets/glsl/Terrain.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/Terrain.frag"));
 
+        vao.initialize_handle();
+
+        atmos_prop_buffer.initialize_handle();
+        atmos_prop_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+
+        terrain_params_buffer.initialize_handle();
+        terrain_params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
 
-    // using default framebuffer
-    void render(const Ref<texture2d_t>& gbuffer0,
-                const Ref<texture2d_t>& gbuffer1){
+    void set(const AtmosphereProperties& ap){
+        atmos_prop_buffer.set_buffer_data(&ap);
+    }
 
+    void update(const vec3& sun_dir, const vec3& sun_radiance, const mat4& sun_proj_view){
+        terrain_params.sun_dir = sun_dir;
+        terrain_params.sun_theta = std::asin(-sun_dir.y);
+        terrain_params.sun_radiance = sun_radiance;
+        terrain_params.shadow_proj_view = sun_proj_view;
+    }
+
+    void update(float max_aerial_dist, float world_scale){
+        terrain_params.max_aerial_dist = max_aerial_dist;
+        terrain_params.world_scale = world_scale;
+    }
+
+    void render(const Ref<texture2d_t>& transmittance_lut,
+                const Ref<texture3d_t>& vbuffer0,
+                const Ref<texture3d_t>& vbuffer1,
+                const Ref<texture2d_t>& gbuffer0,
+                const Ref<texture2d_t>& gbuffer1,
+                const Ref<texture2d_t>& shadow_map,
+                const vec3f& view_pos,
+                const mat4& camera_proj_view){
+        terrain_params.view_pos = view_pos;
+        terrain_params.camera_proj_view = camera_proj_view;
+        terrain_params_buffer.set_buffer_data(&terrain_params);
+
+        transmittance_lut->bind(0);
+        vbuffer0->bind(1);
+        vbuffer1->bind(2);
+        gbuffer0->bind(3);
+        gbuffer1->bind(4);
+        shadow_map->bind(5);
+
+        GL_LinearClampSampler::Bind(0);
+        GL_LinearClampSampler::Bind(1);
+        GL_LinearClampSampler::Bind(2);
+        GL_NearestRepeatSampler::Bind(3);
+        GL_NearestRepeatSampler::Bind(4);
+        GL_NearestRepeatSampler::Bind(5);
+
+        atmos_prop_buffer.bind(0);
+        terrain_params_buffer.bind(1);
+
+        shader.bind();
+        vao.bind();
+
+        GL_EXPR(glDepthFunc(GL_LEQUAL));
+        GL_EXPR(glDrawArrays(GL_TRIANGLE_STRIP, 0, 4));
+        GL_EXPR(glDepthFunc(GL_LESS));
+
+        vao.unbind();
+        shader.unbind();
     }
 
   private:
     program_t shader;
+    struct alignas(16) TerrainParams{
+        vec3f sun_dir; float sun_theta;
+        vec3f sun_radiance; float max_aerial_dist = 2000.f;
+        vec3f view_pos; float world_scale = 50.f;
+        mat4 shadow_proj_view;
+        mat4 camera_proj_view;
+    }terrain_params;
+    std140_uniform_block_buffer_t<TerrainParams> terrain_params_buffer;
+    std140_uniform_block_buffer_t<AtmosphereProperties> atmos_prop_buffer;
+
+    vertex_array_t vao;
 };
 
 //每次只更新部分，第一次耗时较长
@@ -598,9 +687,11 @@ class ClipMapGenerator{
     void generate(){
 
     }
+
     const std::vector<Ref<texture3d_t>>& getLUT(){
         return clip_maps;
     }
+
   private:
     program_t c_shader;
     std::vector<Ref<texture3d_t>> clip_maps;
@@ -625,6 +716,7 @@ class AerialLUTGenerator{
         intersect_vol_uid_buffer.initialize_handle();
         intersect_vol_uid_buffer.initialize_buffer_data(nullptr, MaxLocalVolumeN + 1, GL_DYNAMIC_STORAGE_BIT);
     }
+
     void resize(const vec3i& res){
         if(res == vbuffer_res) return;
         vbuffer_res = res;
@@ -685,8 +777,8 @@ class PostProcessRenderer{
   public:
     void initialize() {
         shader = program_t::build_from(
-            shader_t<GL_VERTEX_SHADER>::from_file("asset/glsl/Quad.vert"),
-            shader_t<GL_FRAGMENT_SHADER>::from_file("asset/glsl/PostProcess.frag"));
+            shader_t<GL_VERTEX_SHADER>::from_file("assets/glsl/Quad.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/PostProcess.frag"));
 
         vao.initialize_handle();
     }
@@ -727,7 +819,7 @@ private:
 
         InitAllSampler();
 
-        loadTerrain(mat4::identity(), "assets/terrain.obj", "", "assets/normal.jpg");
+        loadTerrain(transform ::translate(0.f, 15.f, 0.f), "assets/terrain.obj", "", "");
 
         auto [window_w, window_h] = window->get_window_size();
 
@@ -738,6 +830,7 @@ private:
         offscreen_frame.color = newRef<texture2d_t>();
         offscreen_frame.color->initialize_handle();
         offscreen_frame.color->initialize_texture(1, GL_RGBA8, window_w, window_h);
+        offscreen_frame.fbo.attach(GL_COLOR_ATTACHMENT0, *offscreen_frame.color);
         assert(offscreen_frame.fbo.is_complete());
 
         std_unit_atmos_prop = preset_atmos_prop.toStdUnit();
@@ -767,7 +860,9 @@ private:
         dl_shadow_generator.initialize();
 
         terrain_renderer.initialize();
-
+        terrain_renderer.set(std_unit_atmos_prop);
+        terrain_renderer.update(sun_dir, sun_color * sun_intensity, _);
+        terrain_renderer.update(2000.f, 50.f);
 
         post_process_renderer.initialize();
 
@@ -778,6 +873,7 @@ private:
 
         // init test local volume
         {
+            local_volume_test.vol0 = newRef<LocalVolume>();
             local_volume_test.vol0->desc_name = "test_local_volume0";
             local_volume_test.vol0->info.low = vec3f(0.f, 0.f, 0.f);
             local_volume_test.vol0->info.high = vec3f(1.f, 1.f, 1.f);
@@ -785,7 +881,7 @@ private:
             local_volume_test.vol0->info.model = mat4::identity();
             local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(1.f, 1.f, 0.f, 1.f));
 
-
+            local_volume_test.vol1 = newRef<LocalVolume>();
             local_volume_test.vol1->desc_name = "test_local_volume1";
             local_volume_test.vol1->info.low = vec3f(1.5f, 0.f, 0.f);
             local_volume_test.vol1->info.high = vec3f(2.5f, 1.f, 1.f);
@@ -869,12 +965,14 @@ private:
                 ImGui::TreePop();
             }
             update_sky_lut_params |= update_sun;
-
-            if(update_sky_lut_params){
-                auto [sun_dir, _] = getSunLight();
+            auto [sun_dir, _] = getSunLight();
+            if(update_sky_lut_params || update_sun){
                 sky_lut_generator.update(sun_dir, sun_intensity * sun_color, sky_lut_ray_marching_steps, sky_lut_enable_multi_scattering);
             }
 
+            if(update_sun){
+                terrain_renderer.update(sun_dir, sun_color * sun_intensity, _);
+            }
 
         }
 
@@ -917,10 +1015,15 @@ private:
         gbuffer_generator.end();
         auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
 
-
+        auto [vbuffer0, vbuffer1] = aerial_lut_generator.getLUT();
         // todo
         bindToOffScreenFrame(true);
-        terrain_renderer.render(gbuffer0, gbuffer1);
+        terrain_renderer.render(trans_generator.getLUT(),
+                                vbuffer0, vbuffer1,
+                                gbuffer0, gbuffer1,
+                                dl_shadow_generator.getShadowMap(),
+                                camera.get_position(),
+                                camera_proj_view);
 
 
 
@@ -932,8 +1035,7 @@ private:
         auto camera_dir = camera.get_xyz_direction();
         const vec3f world_up = {0.f, 1.f, 0.f};
 
-//        framebuffer_t::bind_to_default();
-//        framebuffer_t::clear_color_depth_buffer();
+
         bindToOffScreenFrame();
         GL_EXPR(glViewport(0, 0, window->get_window_width(), window->get_window_height()));
 
@@ -950,7 +1052,7 @@ private:
     }
 
 	void destroy() override {
-
+        DestroyAllSampler();
     }
 private:
     // compute world scene boundary
@@ -1028,6 +1130,7 @@ private:
     }
     void bindToOffScreenFrame(bool clear = false){
         offscreen_frame.fbo.bind();
+        GL_EXPR(glDrawBuffer(GL_COLOR_ATTACHMENT0));
         GL_EXPR(glViewport(0, 0, window->get_window_width(), window->get_window_height()));
         if(clear){
             GL_EXPR(glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT));

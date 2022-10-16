@@ -1,16 +1,12 @@
 #version 460 core
-layout(location = 0) in vec3 iVertexPos;
 
-layout(location = 0) out vec3 oVertexPos;
+const vec2 ScreenQuadVertexCoord[4]={ vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0), vec2(1.0, 1.0) };
+const vec2 ScreenQuadTexCoord[4]={ vec2(0, 0), vec2(1, 0), vec2(0, 1.0), vec2(1.0, 1.0) };
 
-layout(binding = 0) uniform Transform{
-    mat4 Model;
-    mat4 MVP;
-};
+layout(location = 0) out vec2 oScreenCoord;
 
-void main() {
-    gl_Position = MVP * vec4(iVertexPos, 1.0);
-
-    oVertexPos = vec3(Model * vec4(iVertexPos, 1.0));
-
+void main()
+{
+    gl_Position = vec4(ScreenQuadVertexCoord[gl_VertexID].x, ScreenQuadVertexCoord[gl_VertexID].y, 0, 1.0);
+    oScreenCoord = ScreenQuadTexCoord[gl_VertexID];
 }

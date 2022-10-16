@@ -11,22 +11,26 @@ layout(binding = 1) uniform sampler2D NormalMap;
 layout(location = 0) out vec4 output0;
 layout(location = 1) out vec4 output1;
 
-vec2 octWrap(vec2 v)
-{
-    return (1.0 - abs(v.yx)) * vec2((v.x >= 0.0 ? 1.0 : -1.0), (v.y >= 0.0 ? 1.0 : -1.0));
-}
 
+vec2 msign( vec2 v )
+{
+    return vec2( (v.x>=0.0) ? 1.0 : -1.0,
+    (v.y>=0.0) ? 1.0 : -1.0 );
+}
 // https://knarkowicz.wordpress.com/2014/04/16/octahedron-normal-vector-encoding/
 // https://www.shadertoy.com/view/llfcRl
-vec2 encodeNormal(vec3 n)
+vec2 encodeNormal(vec3 nor)
 {
-    n /= (abs(n.x) + abs(n.y) + abs(n.z));
-    n.xy = n.z >= 0.0 ? n.xy : octWrap(n.xy);
-    n.xy = n.xy * 0.5 + 0.5;
-    return n.xy;
+    nor.xy /= ( abs( nor.x ) + abs( nor.y ) + abs( nor.z ) );
+    nor.xy  = (nor.z >= 0.0) ? nor.xy : (1.0-abs(nor.yx))*msign(nor.xy);
+    return nor.xy;
 }
 
-
+layout(binding = 0) uniform Transform{
+    mat4 Model;
+    mat4 ViewModel;
+    mat4 ProjViewModel;
+};
 
 void main() {
     vec3 world_normal  = normalize(iFragNormal);
@@ -48,4 +52,5 @@ void main() {
     //ok, just need two rgba32f texture
     output0 = vec4(iFragPos, normal.x);
     output1 = vec4(color1, color2, iViewDepth, normal.y);
+
 }

@@ -1,5 +1,6 @@
 #include "common.hpp"
-
+#include <queue>
+#include <unordered_set>
 #include <cyPoint.h>
 #include <cySampleElim.h>
 
@@ -97,14 +98,40 @@ std::vector<vec2f> GetPoissonDiskSamples(int count) {
 
 
 struct LocalVolumeGeometryInfo{
+    LocalVolumeGeometryInfo() = default;
+    LocalVolumeGeometryInfo(const LocalVolumeGeometryInfo&) = default;
     vec3f low; int uid;
     vec3f high; int pad;
     mat4 model;// not consider rotate current so it's just AABB now
 };
 
 struct LocalVolumeCube : public LocalVolumeGeometryInfo{
+    explicit LocalVolumeCube(const LocalVolumeGeometryInfo& info)
+    : LocalVolumeGeometryInfo(info)
+    {
+        vao.initialize_handle();
+        vbo.initialize_handle();
+        vec3 vertices[8];
+        vertices[0] = low, vertices[1] = vec3(high.x, low.y, low.z);
+        vertices[2] = vec3(high.x, high.y, low.z), vertices[3] = vec3(low.x, high.y, low.z);
+        vertices[4] = vec3(low.x, low.y, high.z), vertices[5] = vec3(high.x, low.y, high.z);
+        vertices[6] = high, vertices[7] = vec3(low.x, high.y, high.z);
+        vbo.reinitialize_buffer_data(vertices, 8, GL_STATIC_DRAW);
+        static uint32_t indices[24] = {
+            0, 1,  1, 2,  2, 3,  3, 0,
+            4, 5,  5, 6,  6, 7,  7, 4,
+            0, 4,  1, 5,  2, 6,  3, 7
+        };
+        ebo.initialize_handle();
+        ebo.reinitialize_buffer_data(indices, 24, GL_STATIC_DRAW);
+        vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec3>(0), vbo, 0);
+        vao.enable_attrib(attrib_var_t<vec3>(0));
+        vao.bind_index_buffer(ebo);
+
+    }
     vertex_array_t vao;
     vertex_buffer_t<vec3f> vbo;// line mode for debug
+    index_buffer_t<uint32_t> ebo;
 };
 
 struct LocalVolume{
@@ -573,6 +600,55 @@ class GBufferGenerator{
     std140_uniform_block_buffer_t<Transform> transform_buffer;
 };
 
+
+class WireFrameRenderer{
+  public:
+    void initialize() {
+        shader = program_t::build_from(
+            shader_t<GL_VERTEX_SHADER>::from_file("assets/glsl/WireFrame.vert"),
+            shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/WireFrame.frag"));
+
+        params_buffer.initialize_handle();
+        params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+    }
+    void begin(){
+        shader.bind();
+        GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_LINE));
+        GL_EXPR(glDisable(GL_DEPTH_TEST));
+    }
+
+    void draw(const Ref<LocalVolumeCube>& cube,
+              const vec4& line_color,
+              const mat4& proj_view){
+        params.mvp = proj_view * cube->model;
+        params.line_color = line_color;
+        params_buffer.set_buffer_data(&params);
+        params_buffer.bind(0);
+
+        cube->vao.bind();
+
+        GL_EXPR(glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, nullptr));
+
+        cube->vao.unbind();
+    }
+
+    void end(){
+        shader.unbind();
+        GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_FILL));
+        GL_EXPR(glEnable(GL_DEPTH_TEST));
+    }
+
+  private:
+    program_t shader;
+
+    struct alignas(16) Params{
+        mat4 mvp;
+        vec4 line_color;
+    }params;
+    std140_uniform_block_buffer_t<Params> params_buffer;
+
+};
+
 // tile based defer render
 class TerrainRenderer{
   public:
@@ -703,18 +779,133 @@ class ClipMapGenerator{
     }clip;
 };
 
+class VirtualTexMgr{
+  public:
+    void initialize(int tex_num_, const vec3i& tex_shape_, int l){
+        this->tex_num = tex_num_;
+        this->tex_shape = tex_shape_;
+        this->block_length = l;
+        assert(tex_shape_.x % l == 0 && tex_shape_.y % l == 0 && tex_shape_.z % l == 0);
+
+        vec3i size = tex_shape_ / l;
+        for(int i = 0; i < tex_num_; i++){
+            for(int z = 0; z < size.z; z++){
+                for(int y = 0; y < size.y; y++){
+                    for(int x = 0; x < size.x; x++){
+                        table.emplace_back(x, y, z, i);
+                    }
+                }
+            }
+        }
+
+        vpt_buffer = newRef<storage_buffer_t<VirtualInfoT>>();
+        vpt_buffer->initialize_handle();
+        vpt_buffer->initialize_buffer_data(nullptr, sizeof(VPageTable), GL_DYNAMIC_STORAGE_BIT);
+
+        for(int i = 0; i < tex_num_; i++){
+            auto& tex  = virtual_textures.emplace_back(newRef<texture3d_t>());
+            tex->initialize_handle();
+            tex->initialize_texture(1, GL_RGBA32F, tex_shape_.x, tex_shape_.y, tex_shape_.z);
+        }
+
+
+        reset();
+    }
+
+
+    void reset(){
+        while(!free_blocks.empty()) free_blocks.pop();
+        for(auto& x : table) free_blocks.push(x);
+        used_vol_set.clear();
+        vpt = VPageTable();
+
+    }
+
+    //先暂时只是固定大小的纹理尺寸
+    bool upload(const Ref<LocalVolume>& vol){
+        if(used_vol_set.count(vol->info.uid)){
+            std::cerr << "duplicate upload local volume" << std::endl;
+            return false;
+        }
+        if(free_blocks.size() < 2) return false;
+        int uid = vol->info.uid;
+        assert(uid >= 0 && uid < 15);
+        used_vol_set.insert(uid);
+
+        auto tex_coord = free_blocks.front();
+        free_blocks.pop();
+
+        auto pos = tex_coord.xyz() * block_length;
+        vpt.infos[uid].origin0 = vec4(pos.x, pos.y, pos.z, tex_coord.w);
+        vpt.infos[uid].shape0 = vec4(block_length, block_length, block_length, 0);
+
+        virtual_textures[tex_coord.w]->set_texture_data(pos.x, pos.y, pos.z,
+                                                        block_length, block_length, block_length,
+                                                        vol->vbuffer0.get_raw_data());
+
+        tex_coord = free_blocks.front();
+        free_blocks.pop();
+
+        pos = tex_coord.xyz() * block_length;
+        vpt.infos[uid].origin1 = vec4(pos.x, pos.y, pos.z, tex_coord.w);
+        vpt.infos[uid].shape1 = vec4(block_length, block_length, block_length, 0);
+
+        virtual_textures[tex_coord.w]->set_texture_data(pos.x, pos.y, pos.z,
+                                                        block_length, block_length, block_length,
+                                                        vol->vbuffer1.get_raw_data());
+
+        vpt_buffer->set_buffer_data(&vpt, 0, sizeof(vpt));
+
+        return true;
+    }
+    auto getVPTBuffer() const {
+        return vpt_buffer;
+    }
+    const auto& getVirtualTextures() const {
+        return virtual_textures;
+    }
+  private:
+    vec3i tex_shape;
+    int tex_num;
+    int block_length;
+    struct VirtualInfoT{
+        vec4 origin0, origin1;
+        vec4 shape0, shape1;
+    };
+    struct alignas(16) VPageTable{
+        VirtualInfoT infos[16];
+    }vpt;
+    Ref<storage_buffer_t<VirtualInfoT>> vpt_buffer;
+    std::vector<vec4i> table;
+    std::queue<vec4i> free_blocks;
+    std::unordered_set<int> used_vol_set;
+
+
+    std::vector<Ref<texture3d_t>> virtual_textures;
+
+};
+
 //填充froxel属性并计算累积值 包括大气散射、局部雾和全局雾
 //体积阴影在mesh渲染处考虑，这里仅考虑体积自遮挡
 class AerialLUTGenerator{
   public:
     void initialize() {
+        c_fill_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/FillVolumeMedia.comp"));
+
+        c_calc_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/CalcFroxel.comp"));
+
 
         vbuffer0 = newRef<texture3d_t>();
         vbuffer1 = newRef<texture3d_t>();
 
 
         intersect_vol_uid_buffer.initialize_handle();
-        intersect_vol_uid_buffer.initialize_buffer_data(nullptr, MaxLocalVolumeN + 1, GL_DYNAMIC_STORAGE_BIT);
+        intersect_vol_uid_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+
+        params_buffer.initialize_handle();
+        params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
 
     void resize(const vec3i& res){
@@ -742,14 +933,50 @@ class AerialLUTGenerator{
             }
         }
         view_volumes[0] = view_volumes.size() - 1;
-        intersect_vol_uid_buffer.set_buffer_data(view_volumes.data(), 0, view_volumes.size() * sizeof(int));
-        LOG_DEBUG("camera view local volume count : ", view_volumes[0]);
-
-
+        for(int i = 0; i < view_volumes[0] + 1; i++)
+            intersect_volume.uid[i] = view_volumes[i];
+        intersect_vol_uid_buffer.set_buffer_data(&intersect_volume);
+        LOG_DEBUG("camera view local volume count : {0}", view_volumes[0]);
 
     }
 
+    void prepare(const VirtualTexMgr& mgr){
+        mgr.getVPTBuffer()->bind(1);
+        auto& texes = mgr.getVirtualTextures();
+        const int unit_base = 2;
+        int unit_offset = 0;
+        for(auto& tex : texes){
+            tex->bind(unit_base + unit_offset++);
+        }
+    }
+
     void generate(){
+        intersect_vol_uid_buffer.bind(0);
+        params_buffer.bind(2);
+
+
+        c_fill_shader.bind();
+
+        vbuffer0->bind_image(0, 0, GL_READ_WRITE, GL_RGBA32F);
+        vbuffer1->bind_image(1, 0, GL_READ_WRITE, GL_RGBA32F);
+
+
+
+
+
+        c_fill_shader.unbind();
+
+
+
+        c_calc_shader.bind();
+
+        vbuffer0->bind(0);
+        vbuffer1->bind(1);
+        GL_LinearClampSampler::Bind(0);
+        GL_LinearClampSampler::Bind(1);
+
+
+        c_calc_shader.unbind();
 
     }
 
@@ -765,7 +992,15 @@ class AerialLUTGenerator{
     static constexpr int MaxLocalVolumeN = 15;
 
     // volume uid that intersect with camera frustum
-    storage_buffer_t<int> intersect_vol_uid_buffer;
+    struct IntersectVolumeUID{
+        int uid[16];
+    }intersect_volume;
+    std140_uniform_block_buffer_t<IntersectVolumeUID> intersect_vol_uid_buffer;
+
+    struct alignas(16) Params{
+
+    }params;
+    std140_uniform_block_buffer_t<Params> params_buffer;
 
 
     Ref<texture3d_t> vbuffer0;
@@ -864,6 +1099,9 @@ private:
         terrain_renderer.update(sun_dir, sun_color * sun_intensity, _);
         terrain_renderer.update(2000.f, 50.f);
 
+        wireframe_renderer.initialize();
+
+
         post_process_renderer.initialize();
 
         //camera
@@ -872,24 +1110,39 @@ private:
         camera.set_direction(0, 0.12);
 
         // init test local volume
+        const int vds = 128;
+        vtex_mgr.initialize(2, {512, 512, 512}, vds);
         {
             local_volume_test.vol0 = newRef<LocalVolume>();
             local_volume_test.vol0->desc_name = "test_local_volume0";
-            local_volume_test.vol0->info.low = vec3f(0.f, 0.f, 0.f);
-            local_volume_test.vol0->info.high = vec3f(1.f, 1.f, 1.f);
+            local_volume_test.vol0->info.low = vec3f(0.f, 25.f, 0.f);
+            local_volume_test.vol0->info.high = vec3f(2.f, 27.f, 2.f);
             local_volume_test.vol0->info.uid = 1;
             local_volume_test.vol0->info.model = mat4::identity();
             local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(1.f, 1.f, 0.f, 1.f));
+            local_volume_test.vol0->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.5f));
+
+            local_volume_test.debug_vol0cube = newRef<LocalVolumeCube>(local_volume_test.vol0->info);
+
+            auto ret = vtex_mgr.upload(local_volume_test.vol0);
+            assert(ret);
 
             local_volume_test.vol1 = newRef<LocalVolume>();
             local_volume_test.vol1->desc_name = "test_local_volume1";
-            local_volume_test.vol1->info.low = vec3f(1.5f, 0.f, 0.f);
-            local_volume_test.vol1->info.high = vec3f(2.5f, 1.f, 1.f);
+            local_volume_test.vol1->info.low = vec3f(4.5f, 25.f, 4.f);
+            local_volume_test.vol1->info.high = vec3f(7.5f, 27.f, 7.f);
             local_volume_test.vol1->info.uid = 2;
             local_volume_test.vol1->info.model = mat4::identity();
+            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(1.f, 1.f, 1.f, 1.f));
+            local_volume_test.vol1->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, -0.5f));
+
+            local_volume_test.debug_vol1cube = newRef<LocalVolumeCube>(local_volume_test.vol1->info);
 
 
+            ret = vtex_mgr.upload(local_volume_test.vol1);
+            assert(ret);
         }
+
     }
 
 	void frame() override {
@@ -988,7 +1241,10 @@ private:
             std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1};
             aerial_lut_generator.prepare(camera_proj_view, visible_local_volumes);
 
+            aerial_lut_generator.prepare(vtex_mgr);
+
             aerial_lut_generator.generate();
+
 
 
         }
@@ -1041,6 +1297,17 @@ private:
 
         sky_view_renderer.render(camera_dir, cross(camera_dir, world_up).normalized(), deg2rad(CameraFovDegree),
                                  sky_lut_generator.getLUT());
+
+
+        {
+            wireframe_renderer.begin();
+
+            wireframe_renderer.draw(local_volume_test.debug_vol0cube, vec4(1.f, 0.f, 0.f, 1.f), camera_proj_view);
+
+            wireframe_renderer.draw(local_volume_test.debug_vol1cube, vec4(1.f, 1.f, 0.f, 1.f), camera_proj_view);
+
+            wireframe_renderer.end();
+        }
 
 
         framebuffer_t::bind_to_default();
@@ -1194,6 +1461,8 @@ private:
 
     SkyViewRenderer sky_view_renderer;
 
+    VirtualTexMgr vtex_mgr;
+
     AerialLUTGenerator aerial_lut_generator;
     vec3i aerial_lut_res = {200, 150, 32};
 
@@ -1203,7 +1472,7 @@ private:
 
     TerrainRenderer terrain_renderer;
 
-
+    WireFrameRenderer wireframe_renderer;
 
     PostProcessRenderer post_process_renderer;
 
@@ -1217,13 +1486,16 @@ private:
     // test and debug
     struct {
         Ref<LocalVolume> vol0;
+        Ref<LocalVolumeCube> debug_vol0cube;
         Ref<LocalVolume> vol1;
+        Ref<LocalVolumeCube> debug_vol1cube;
     }local_volume_test;
 
 };
 
 
 int main(){
+    SET_LOG_LEVEL_DEBUG
     VolumeRenderer(window_desc_t{
             .size = {1600, 900},
             .title = "VolumeRenderer",

@@ -1,11 +1,230 @@
 #version 460 core
 
+#define PI 3.14159265
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(binding = 0) uniform sampler3D VBuffer0;
-layout(binding = 1) uniform sampler3D VBuffer1;
+layout(std140, binding = 0) uniform AtmosphereProperties{
+    vec3 RayleighScattering;
+    float RayleighDensityH;
 
+    float MieScattering;
+    float MieAsymmetryG;
+    float MieAbsorption;
+    float MieDensityH;
+
+    vec3 OzoneAbsorption;
+    float OzoneCenterH;
+    float OzoneWidth;
+
+    float GroundRadius;
+    float TopAtmosphereRadius;
+    float pad;
+};
+
+layout(std140, binding = 1) uniform AerialParams{
+    vec3 SunDir;
+    float SunTheta;
+
+    vec3 FrustumA;
+    float ViewHeight;
+    vec3 FrustumB;
+    float MaxAerialDist;
+    vec3 FrustumC;
+    int EnableShadow;
+    vec3 FrustumD;
+
+    vec3 ViewPos;
+
+    int RayMarchingStepsPerSlice;
+
+    int SliceZCount;
+
+    mat4 SunProjView;
+};
+
+layout(binding = 0) uniform sampler2D TransmittanceLUT;
+layout(binding = 1) uniform sampler2D MultiScatteringLUT;
+layout(binding = 2) uniform sampler3D VBuffer0;
+layout(binding = 3) uniform sampler3D VBuffer1;
+layout(binding = 4) uniform sampler2D ShadowMap;
+layout(binding = 5) uniform sampler2D BlueNoiseMap;
+
+layout(binding = 0, rgba32f) uniform writeonly image3D FroxelLUT;
+
+
+bool FindClosestIntersectionWithCircle(vec2 o, vec2 d, float R, out float t){
+    float A = dot(d, d);
+    float B = 2 * dot(o, d);
+    float C = dot(o, o) - R * R;
+    float delta = B * B - 4 * A * C;
+    if (delta < 0)
+    return false;
+    t = (-B + (C <= 0 ? sqrt(delta) : -sqrt(delta))) / (2 * A);
+    return (C <= 0) || (B <= 0);
+}
+
+bool HasIntersectionWithSphere(vec3 o, vec3 d, float R){
+    float A = dot(d, d);
+    float B = 2 * dot(o, d);
+    float C = dot(o, o) - R * R;
+    float delta = B * B - 4 * A * C;
+    return (delta >= 0) && ((C <= 0) || (B <= 0));
+}
+
+void GetSigmaST(float h, out vec3 sigma_s, out vec3 sigma_t){
+    vec3 rayleigh = RayleighScattering * exp(-h / RayleighDensityH);
+    vec3 mie_s = vec3(MieScattering) * exp(-h / MieDensityH);
+    vec3 mie_t = vec3(MieScattering + MieAbsorption) * exp(-h / MieDensityH);
+    vec3 ozone = OzoneAbsorption * max(0.0, 1 - abs(h - OzoneCenterH) / (OzoneWidth * 0.5));
+    sigma_s = rayleigh + mie_s;
+    sigma_t = rayleigh + mie_t + ozone;
+}
+
+vec3 EvalPhaseFunction(float h, float u){
+    vec3 sRayleigh = RayleighScattering * exp(-h / RayleighDensityH);
+    float sMie = MieScattering * exp(-h / MieDensityH);
+    vec3 s = sRayleigh + sMie;
+
+    float g = MieAsymmetryG, g2 = g * g, u2 = u * u;
+    float pRayleigh = 3 / (16 * PI) * (1 + u2);
+
+    float m = 1 + g2 - 2 * g * u;
+    float pMie = 3 / (8 * PI) * (1 - g2) * (1 + u2) / ((2 + g2) * m * sqrt(m));
+
+    vec3 result;
+    result.x = s.x > 0 ? (pRayleigh * sRayleigh.x + pMie * sMie) / s.x : 0;
+    result.y = s.y > 0 ? (pRayleigh * sRayleigh.y + pMie * sMie) / s.y : 0;
+    result.z = s.z > 0 ? (pRayleigh * sRayleigh.z + pMie * sMie) / s.z : 0;
+    return result;
+}
+
+float SafeSqrt(float a) {
+    return sqrt(max(a, 0.0));
+}
+
+float ClampDistance(float d) {
+    return max(d, 0.0);
+}
+
+float DistanceToTopAtmosphereBoundary(float r, float mu){
+    float discriminant = r * r * (mu * mu - 1.0) + TopAtmosphereRadius * TopAtmosphereRadius;
+    return ClampDistance(-r * mu + SafeSqrt(discriminant));
+}
+
+// mapping form [0, 1] to [0.5 / n, 1 - 0.5 / n]
+float GetTextureCoordFromUnitRange(float x, int texture_size) {
+    return 0.5 / float(texture_size) + x * (1.0 - 1.0 / float(texture_size));
+}
+
+vec2 GetTransmittanceTextureUVFromRMu(float r, float mu, in ivec2 res){
+    float H =  sqrt(TopAtmosphereRadius * TopAtmosphereRadius - GroundRadius * GroundRadius);
+    float rho = SafeSqrt(r * r - GroundRadius * GroundRadius);
+    float d = DistanceToTopAtmosphereBoundary(r, mu);
+    float d_min = (TopAtmosphereRadius - r);
+    float d_max = rho + H;
+    float x_mu = (d - d_min) / (d_max - d_min);
+    float x_r = rho / H;
+    return vec2(GetTextureCoordFromUnitRange(x_mu, res.x), GetTextureCoordFromUnitRange(x_r, res.y));
+}
+
+// theta is view with horizon
+vec3 GetTransmittance(float h, float theta){
+    float r = h * 0.99  + GroundRadius;
+    float mu = cos(PI / 2 - theta);
+    vec2 uv = GetTransmittanceTextureUVFromRMu(r, mu, textureSize(TransmittanceLUT, 0));
+    return texture(TransmittanceLUT, uv).rgb;
+}
+
+vec3 GetMultiScattering(float h, float theta){
+    float u = h / (TopAtmosphereRadius - GroundRadius);
+    float v = 0.5 + 0.5 * sin(theta);
+    return texture(MultiScatteringLUT, vec2(u, v)).rgb;
+}
+
+float RelativeLuminance(vec3 c){
+    return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+}
 
 void main(){
+    ivec3 res = imageSize(AerialPerspectiveLUT);
+    res.z = SliceZCount;
+    ivec2 g_index = ivec2(gl_WorkGroupSize.xy * gl_WorkGroupID.xy + gl_LocalInvocationID.xy);
+    if (g_index.x >= res.x || g_index.y >= res.y){
+        return;
+    }
+
+    float x = (g_index.x + 0.5) / res.x;
+    float y = (g_index.y + 0.5) / res.y;
+    vec3 view_dir = normalize(mix(mix(FrustumA, FrustumB, x), mix(FrustumC, FrustumD, x), y));
+    vec3 planet_view_pos = vec3(0, ViewHeight + GroundRadius, 0);// world scale ?
+    float u = dot(sun_dir, -view_dir);
+
+
+    float max_t = 0;
+    if (!FindClosestIntersectionWithSphere(planet_view_pos, view_dir, GroundRadius, max_t)){
+        FindClosestIntersectionWithSphere(planet_view_pos, view_dir, TopAtmosphereRadius, max_t);
+    }
+
+    float slice_depth = MaxAerialDist / res.z;
+    float start_t = 0.0;
+    float end_t = min(max_t, 0.5 * slice_depth);
+
+    vec3 sum_sigma_t = vec3(0);
+    vec3 sum_in_scattering = vec3(0);
+
+    for(int z = 0; z < SliceZCount; ++z){
+        float dt = (end_t - start_t) / RayMarchingStepsPerSlice;
+        float t = start_t;
+        for(int i = 0; i < RayMarchingStepsPerSlice; ++i){
+            float w = (z + 0.5f + float(i) / z) / SliceZCount;
+            float mid_t = t + dt * 0.5f;
+            vec3 ith_pos = planet_view_pos + view_dir * mid_t;
+            float ith_height = length(ith_pos) - GroundRadius;
+            vec3 ith_sigma_s, ith_sigma_t;
+            // get from atmos
+            GetSigmaST(ith_height, ith_sigma_s, ith_sigma_t);
+            // get from volume
+            vec4 st = texture(VBuffer0, vec3(x, y, w)).rgba;
+            ith_sigma_s += st.rgb;
+            ith_sigma_t += st.a;
+
+            vec3 ith_trans = exp(-(sum_sigma_t + ith_sigma_t * dt * 0.5));
+            sum_in_scattering += GetMultiScattering(ith_height, SunTheta) * ith_sigma_s * ith_trans * dt;
+
+            // if is visiable with sun
+            // todo support other lights, point light
+            if(HasIntersectionWithSphere(ith_pos, -SunDir, GroundRadius)){
+                bool in_shadow = bool(EnableShadow);
+                if(bool(EnableShadow)){
+                    vec3 shadow_pos = ViewPos + view_dir * mid_t; // world_scale?
+                    vec4 shadow_ndc = SunProjView * vec4(shadow_pos, 1.0);
+                    shadow_ndc /= shadow_ndc.w;
+                    vec3 shadow_clip = shadow_ndc.xyz * 0.5 + 0.5;
+                    vec2 shadow_uv = shadow_clip.xy;
+                    if(all(equal(clamp(shadow_uv, vec2(0), vec2(1)), shadow_uv))){
+                        float shadow_z = texture(ShadowMap, shadow_uv).r;
+                        in_shadow = shadow_clip.z >= shadow_z;
+                    }
+                }
+                if(!in_shadow){
+                    vec3 rho = EvalPhaseFunction(ith_height, u);
+                    vec3 ith_sun_trans = GetTransmittance(ith_height, SunTheta);
+                    sum_in_scattering += ith_sun_trans * ith_sigma_s * rho * ith_sun_trans * dt;
+                }
+            }
+
+
+            sum_sigma_t += ith_sigma_t * dt;
+            t += dt;
+        }
+        // store current slice
+        float trans = RelativeLuminance(exp(-sum_sigma_t));
+        imageStore(FroxelLUT, ivec3(g_index, z), vec4(sum_in_scattering, trans));
+        // next slice
+        start_t = end_t;
+        end_t = min(max_t, end_t + slice_depth);
+    }
+
 
 }

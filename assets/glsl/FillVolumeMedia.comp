@@ -11,17 +11,19 @@ struct GeometryInfoT{
 };
 
 // intersect with frustum
-layout(binding = 0, std430) buffer IntersectVolumeUID{
+layout(binding = 0, std140) uniform IntersectVolumeUID{
     // 0 store count
     // size = MaxLocalVolumeN + 1
     // data from 1 to count
-    int IntersectUID[];
+    int IntersectUID[MaxLocalVolumeN + 1];
+};
+
+layout(binding = 1, std140) uniform IntersectGeometryInfo{
+    GeometryInfoT IntersectGeometry[MaxLocalVolumeN + 1];
 };
 
 shared GeometryInfoT S_GeometryInfo[MaxLocalVolumeN];
-shared int S_IntersectUID[MaxLocalVolumeN];
-
-const int VirtualTextureTileSize = 16;
+shared int S_IntersectUID[MaxLocalVolumeN + 1];// padding 1 to 16
 
 struct VirtualInfoT{
     // one volume has two RGBA volume data
@@ -32,8 +34,8 @@ struct VirtualInfoT{
 
 };
 
-layout(binding = 1, std430) buffer VirtualTextureTable{
-    VirtualInfoT VirtualInfo[];
+layout(binding = 1, std140) uniform VirtualTextureTable{
+    VirtualInfoT VirtualInfo[MaxLocalVolumeN + 1];
 };
 
 layout(binding = 0) uniform sampler2D GlobalFogTexture[2];
@@ -43,9 +45,9 @@ const int MaxVirtualTextureN = 2;
 
 layout(binding = 2) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
 
-layout(binding = 0) uniform Params{
+layout(binding = 2, std140) uniform Params{
     vec3 WorldOrigin;
-    int MaxSliceN;
+    int SliceZCount;
     vec3 WorldShape;
     vec3 InvVirtualTextureShape;
 };
@@ -61,11 +63,11 @@ void SampleGlobalVolume(in vec3 world_pos, out vec4 rgba0, out vec4 rgba1){
 void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
     VirtualInfoT virtual_info = VirtualInfo[UID];
     int k = int(virtual_info.origin0.w);
-    vec3 sample_pos = (origin0.xyz + offset * shape0.xyz) * InvVirtualTextureShape;
+    vec3 sample_pos = (virtual_info.origin0.xyz + offset * virtual_info.shape0.xyz) * InvVirtualTextureShape;
     rgba0 = texture(VirtualTextures[k], sample_pos).rgba;
 
     k = int(virtual_info.origin1.w);
-    sample_pos = (origin1.xyz + offset * shape1.xyz) * InvVirtualTextureShape;
+    sample_pos = (virtual_info.origin1.xyz + offset * virtual_info.shape1.xyz) * InvVirtualTextureShape;
     rgba1 = texture(VirtualTextures[k],  sample_pos).rgba;
 }
 
@@ -76,12 +78,16 @@ bool Intersect(in vec3 pointPos, in vec3 aabbLow, in vec3 aabbHigh){
 }
 
 //readwrite
-layout(binding = 0, rgba16f) uniform image3D VBuffer0;
-layout(binding = 1, rgba16f) uniform image3D VBuffer1;
+layout(binding = 0, rgba32f) uniform image3D VBuffer0;
+layout(binding = 1, rgba32f) uniform image3D VBuffer1;
 
+const int BlockLen = 6;
+const ivec3 BlockSize = ivec3(BlockLen, BlockLen, BlockLen);
 void main(){
     // todo imageSize bug?
     ivec3 res = imageSize(VBuffer0);
+    res.z = SliceZCount;
+    //一个线程负责一块block区域的填充
     ivec3 g_index = ivec3(gl_WorkGroupSize.xyz * gl_WorkGroupID.xyz + gl_LocalInvocationID.xyz);
     if(g_index.x >= res.x || g_index.y >= res.y || g_index.z >= res.z)
         return;
@@ -91,34 +97,46 @@ void main(){
     for(int i = 0; i < intersect_volume_count; ++i){
         S_IntersectUID[i] = IntersectUID[i + 1];
     }
+    for(int i = 0; i < MaxLocalVolumeN; i++)
+        S_GeometryInfo[i] = IntersectGeometry[i];
 
-    for(int z = 0; z < MaxSliceN; z++){
-        //todo center + jitter + re-project and temporal blend
-        vec3 grid_sample_pos;
-        vec4 vbuffer0, vbuffer1;
-        vec4 rgba0, rgba1;
-        // local volume
-        for(int i = 0; i < intersect_volume_count; ++i){
-                int UID = S_IntersectUID[i];
-                if(Intersect(grid_sample_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
-                    // compute offset
-                    mat4 model = S_GeometryInfo[UID].model;
-                    vec3 offset = grid_sample_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
-                    offset = vec3(model * vec4(offset, 0));
-                    offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
-                    // query for virtual texture
-                    VirtualSample(UID, offset, rgba0, rgba1);
-                    vbuffer0 += rgba0;
-                    vbuffer1 += rgba1;
+    for(int lz = 0; lz < BlockLen; ++lz){
+        for(int ly = 0; ly < BlockLen; ++ly){
+            for(int lx = 0; lx < BlockLen; ++lx){
+                ivec3 index = g_index *  BlockSize;
+                if(index.x >= res.x || index.y >= res.y || index.z >= res.z)
+                    break;
+
+                //todo center + jitter + re-project and temporal blend
+                vec3 grid_sample_pos ;// clip coord -> world pos
+                vec4 vbuffer0, vbuffer1;
+                vec4 rgba0, rgba1;
+                // local volume
+                for(int i = 0; i < intersect_volume_count; ++i){
+                    int UID = S_IntersectUID[i];
+                    if(Intersect(grid_sample_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
+                        // compute offset
+                        mat4 model = S_GeometryInfo[UID].model;
+                        vec3 offset = grid_sample_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
+                        offset = vec3(model * vec4(offset, 0));
+                        offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
+                        // query for virtual texture
+                        VirtualSample(UID, offset, rgba0, rgba1);
+                        vbuffer0 += rgba0;
+                        vbuffer1 += rgba1;
+                    }
                 }
-        }
-        // global volume
-        SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
-        vbuffer0 += rgba0;
-        vbuffer1 += rgba1;
+                // global volume
+                SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
+                vbuffer0 += rgba0;
+                vbuffer1 += rgba1;
 
-        imageStore(VBuffer0, g_index, rgba0);
-        imageStore(VBuffer1, g_index, rgba1);
+                imageStore(VBuffer0, index, rgba0);
+                imageStore(VBuffer1, index, rgba1);
+
+            }
+        }
     }
+
 
 }

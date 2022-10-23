@@ -1,6 +1,6 @@
 #version 460 core
 // 160 * 90 * 256
-layout(local_size_x = 8, local_size_y = 2, local_size_z = 64) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 const int MaxLocalVolumeN = 15;
 
@@ -15,14 +15,14 @@ layout(binding = 0, std140) uniform IntersectVolumeUID{
     // 0 store count
     // size = MaxLocalVolumeN + 1
     // data from 1 to count
-    int IntersectUID[MaxLocalVolumeN + 1];
+    ivec4 IntersectUID[MaxLocalVolumeN + 1];
 };
 
 layout(binding = 1, std140) uniform IntersectGeometryInfo{
     GeometryInfoT IntersectGeometry[MaxLocalVolumeN + 1];
 };
 
-shared GeometryInfoT S_GeometryInfo[MaxLocalVolumeN];
+shared GeometryInfoT S_GeometryInfo[MaxLocalVolumeN + 1];
 shared int S_IntersectUID[MaxLocalVolumeN + 1];// padding 1 to 16
 
 struct VirtualInfoT{
@@ -50,6 +50,9 @@ layout(binding = 2, std140) uniform Params{
     int SliceZCount;
     vec3 WorldShape;
     vec3 InvVirtualTextureShape;
+    mat4 Proj;
+    mat4 InvProj;
+    mat4 InvView;
 };
 
 void SampleGlobalVolume(in vec3 world_pos, out vec4 rgba0, out vec4 rgba1){
@@ -81,7 +84,7 @@ bool Intersect(in vec3 pointPos, in vec3 aabbLow, in vec3 aabbHigh){
 layout(binding = 0, rgba32f) uniform image3D VBuffer0;
 layout(binding = 1, rgba32f) uniform image3D VBuffer1;
 
-const int BlockLen = 6;
+const int BlockLen = 4;
 const ivec3 BlockSize = ivec3(BlockLen, BlockLen, BlockLen);
 void main(){
     // todo imageSize bug?
@@ -89,51 +92,64 @@ void main(){
     res.z = SliceZCount;
     //一个线程负责一块block区域的填充
     ivec3 g_index = ivec3(gl_WorkGroupSize.xyz * gl_WorkGroupID.xyz + gl_LocalInvocationID.xyz);
-    if(g_index.x >= res.x || g_index.y >= res.y || g_index.z >= res.z)
-        return;
 
-
-    int intersect_volume_count = IntersectUID[0];
+    int intersect_volume_count = IntersectUID[0].x;
     for(int i = 0; i < intersect_volume_count; ++i){
-        S_IntersectUID[i] = IntersectUID[i + 1];
+        S_IntersectUID[i] = IntersectUID[i + 1].x;
     }
     for(int i = 0; i < MaxLocalVolumeN; i++)
         S_GeometryInfo[i] = IntersectGeometry[i];
-
+//    int uid = S_IntersectUID[0];
+//    imageStore(VBuffer0, g_index, vec4(S_GeometryInfo[uid].low, 1.0));
+//    imageStore(VBuffer1, g_index, vec4(S_GeometryInfo[uid].high, 1.0));
+//    return;
     for(int lz = 0; lz < BlockLen; ++lz){
         for(int ly = 0; ly < BlockLen; ++ly){
             for(int lx = 0; lx < BlockLen; ++lx){
-                ivec3 index = g_index *  BlockSize;
+                ivec3 index = g_index *  BlockLen + ivec3(lx, ly, lz);
                 if(index.x >= res.x || index.y >= res.y || index.z >= res.z)
-                    break;
+                    continue;
+//                imageStore(VBuffer0, index, vec4(index, 1.0));
+//                imageStore(VBuffer1, g_index, vec4(g_index, 0.5));
+//                return;
 
                 //todo center + jitter + re-project and temporal blend
-                vec3 grid_sample_pos ;// clip coord -> world pos
-                vec4 vbuffer0, vbuffer1;
+                // clip coord -> world pos
+                vec2 clip_xy = (vec2(index.x + 0.5, index.y + 0.5) / res.xy - 0.5) * 2.0;
+                vec4 _clip = Proj * vec4(0.0, 0.0, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
+                float _clip_z = _clip.z / _clip.w * 0.5 + 0.5;
+                vec4 view_xy = InvProj * vec4(clip_xy, _clip_z, 1.0);
+                vec4 view_pos = vec4(view_xy.xy/view_xy.w, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
+                vec4 world_pos = InvView * (view_pos);
+                vec3 grid_sample_pos = world_pos.xyz / world_pos.w;
+                vec4 vbuffer0 = vec4(0), vbuffer1 = vec4(0);
                 vec4 rgba0, rgba1;
                 // local volume
                 for(int i = 0; i < intersect_volume_count; ++i){
                     int UID = S_IntersectUID[i];
                     if(Intersect(grid_sample_pos, S_GeometryInfo[UID].low, S_GeometryInfo[UID].high)){
                         // compute offset
-                        mat4 model = S_GeometryInfo[UID].model;
-                        vec3 offset = grid_sample_pos - vec3(model * vec4(S_GeometryInfo[UID].low, 1));
-                        offset = vec3(model * vec4(offset, 0));
+//                        mat4 model = S_GeometryInfo[UID].model;
+                        vec3 offset = grid_sample_pos - S_GeometryInfo[UID].low;
+//                        offset = vec3(model * vec4(offset, 0));
                         offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
                         // query for virtual texture
-                        VirtualSample(UID, offset, rgba0, rgba1);
+//                        VirtualSample(UID, offset, rgba0, rgba1);
+                        rgba0 = vec4(0.001, 0.0001, 0.0, 0.0001);
                         vbuffer0 += rgba0;
                         vbuffer1 += rgba1;
+//                        return ;
                     }
                 }
                 // global volume
-                SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
-                vbuffer0 += rgba0;
-                vbuffer1 += rgba1;
-
-                imageStore(VBuffer0, index, rgba0);
-                imageStore(VBuffer1, index, rgba1);
-
+//                SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
+//                vbuffer0 += rgba0;
+//                vbuffer1 += rgba1;
+//                imageStore(VBuffer0, index, vec4(index, 1.0));
+//                imageStore(VBuffer1, index, vec4(grid_sample_pos, 1.0));
+                imageStore(VBuffer0, index, vbuffer0);
+                imageStore(VBuffer1, index, vbuffer1);
+//                imageStore(VBuffer1, index, vec4(grid_sample_pos, 0.5));
             }
         }
     }

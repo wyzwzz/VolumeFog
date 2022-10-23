@@ -25,12 +25,11 @@ layout(std140, binding = 0) uniform AtmosphereProperties{
 };
 
 layout(binding = 0) uniform sampler2D TransmittanceLUT;
-layout(binding = 1) uniform sampler3D VBuffer0;// rgba : scattering + tranmittance
-layout(binding = 2) uniform sampler3D VBuffer1;// rgba : emissive + phase g
-layout(binding = 3) uniform sampler2D GBuffer0;
-layout(binding = 4) uniform sampler2D GBuffer1;
-layout(binding = 5) uniform sampler2D ShadowMap;
-layout(binding = 6) uniform sampler2D BlueNoiseMap;
+layout(binding = 1) uniform sampler3D FroxelLUT;// rgba : in-scattering + tranmittance
+layout(binding = 2) uniform sampler2D GBuffer0;
+layout(binding = 3) uniform sampler2D GBuffer1;
+layout(binding = 4) uniform sampler2D ShadowMap;
+layout(binding = 5) uniform sampler2D BlueNoiseMap;
 
 
 layout(binding = 1) uniform TerrianParams{
@@ -107,8 +106,15 @@ void main(){
     vec2 color1 = unpackHalf2x16(floatBitsToUint(p1.x));
     vec3 albedo = vec3(color1.x, p1.g, color1.y);
 
-    //todo
-    vec3 view_transmittance;
+    vec4 ndc = CameraProjView * vec4(world_pos, 1.0);
+    ndc.xyz /= ndc.w;
+    vec3 clip_pos = ndc.xyz * vec3(0.5, -0.5, 0.5) + 0.5;
+    float z = 50.0 * distance(ViewPos, world_pos) / MaxAerialDist;
+    vec4 aerial_res = texture(FroxelLUT, vec3(clip_pos.xy, z));
+
+    vec3 in_scattering = aerial_res.rgb;
+    float view_transmiitance = aerial_res.w;
+
     vec3 sun_transmittance = GetTransmittance(world_pos.y * WorldScale, SunTheta);
 
     vec4 shadow_ndc_pos = ShadowProjView * vec4(world_pos + 0.03 * normal, 1.0);
@@ -123,12 +129,12 @@ void main(){
     }
 
     vec3 color = SunRadiance * (
-        shadow_factor * sun_transmittance * albedo * max(0, dot(normal, -SunDir))
+        in_scattering +
+        shadow_factor * sun_transmittance * albedo * max(0, dot(normal, -SunDir) * view_transmiitance)
     );
 
     color = PostProcessColor(color);
 
-    vec4 ndc = CameraProjView * vec4(world_pos, 1.0);
-    gl_FragDepth = ndc.z / ndc.w * 0.5 + 0.5;
+    gl_FragDepth = clip_pos.z;
     oFragColor = vec4(color, 1.0);
 }

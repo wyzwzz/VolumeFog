@@ -33,11 +33,8 @@ layout(std140, binding = 1) uniform AerialParams{
     vec3 FrustumC;
     int EnableShadow;
     vec3 FrustumD;
-
-    vec3 ViewPos;
-
     int RayMarchingStepsPerSlice;
-
+    vec3 ViewPos;
     int SliceZCount;
 
     mat4 SunProjView;
@@ -54,6 +51,17 @@ layout(binding = 0, rgba32f) uniform writeonly image3D FroxelLUT;
 
 
 bool FindClosestIntersectionWithCircle(vec2 o, vec2 d, float R, out float t){
+    float A = dot(d, d);
+    float B = 2 * dot(o, d);
+    float C = dot(o, o) - R * R;
+    float delta = B * B - 4 * A * C;
+    if (delta < 0)
+    return false;
+    t = (-B + (C <= 0 ? sqrt(delta) : -sqrt(delta))) / (2 * A);
+    return (C <= 0) || (B <= 0);
+}
+
+bool FindClosestIntersectionWithSphere(vec3 o, vec3 d, float R, out float t){
     float A = dot(d, d);
     float B = 2 * dot(o, d);
     float C = dot(o, o) - R * R;
@@ -147,7 +155,7 @@ float RelativeLuminance(vec3 c){
 }
 
 void main(){
-    ivec3 res = imageSize(AerialPerspectiveLUT);
+    ivec3 res = imageSize(FroxelLUT);
     res.z = SliceZCount;
     ivec2 g_index = ivec2(gl_WorkGroupSize.xy * gl_WorkGroupID.xy + gl_LocalInvocationID.xy);
     if (g_index.x >= res.x || g_index.y >= res.y){
@@ -158,7 +166,7 @@ void main(){
     float y = (g_index.y + 0.5) / res.y;
     vec3 view_dir = normalize(mix(mix(FrustumA, FrustumB, x), mix(FrustumC, FrustumD, x), y));
     vec3 planet_view_pos = vec3(0, ViewHeight + GroundRadius, 0);// world scale ?
-    float u = dot(sun_dir, -view_dir);
+    float u = dot(SunDir, -view_dir);
 
 
     float max_t = 0;
@@ -185,19 +193,20 @@ void main(){
             // get from atmos
             GetSigmaST(ith_height, ith_sigma_s, ith_sigma_t);
             // get from volume
-            vec4 st = texture(VBuffer0, vec3(x, y, w)).rgba;
+            vec4 st = texture(VBuffer0, vec3(x, 1.0 - y, w)).rgba;
             ith_sigma_s += st.rgb;
             ith_sigma_t += st.a;
 
             vec3 ith_trans = exp(-(sum_sigma_t + ith_sigma_t * dt * 0.5));
-            sum_in_scattering += GetMultiScattering(ith_height, SunTheta) * ith_sigma_s * ith_trans * dt;
 
-            // if is visiable with sun
+
+
             // todo support other lights, point light
-            if(HasIntersectionWithSphere(ith_pos, -SunDir, GroundRadius)){
+            // if is visiable with sun
+            if(!HasIntersectionWithSphere(ith_pos, -SunDir, GroundRadius)){
                 bool in_shadow = bool(EnableShadow);
                 if(bool(EnableShadow)){
-                    vec3 shadow_pos = ViewPos + view_dir * mid_t; // world_scale?
+                    vec3 shadow_pos = ViewPos + view_dir * mid_t / 50.f; // world_scale?
                     vec4 shadow_ndc = SunProjView * vec4(shadow_pos, 1.0);
                     shadow_ndc /= shadow_ndc.w;
                     vec3 shadow_clip = shadow_ndc.xyz * 0.5 + 0.5;
@@ -213,7 +222,7 @@ void main(){
                     sum_in_scattering += ith_sun_trans * ith_sigma_s * rho * ith_sun_trans * dt;
                 }
             }
-
+            sum_in_scattering += GetMultiScattering(ith_height, SunTheta) * ith_sigma_s * ith_trans * dt;
 
             sum_sigma_t += ith_sigma_t * dt;
             t += dt;
@@ -225,6 +234,4 @@ void main(){
         start_t = end_t;
         end_t = min(max_t, end_t + slice_depth);
     }
-
-
 }

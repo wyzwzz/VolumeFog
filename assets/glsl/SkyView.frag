@@ -20,6 +20,7 @@ layout(std140, binding = 1) uniform SkyViewPerFrameParams{
 };
 
 layout(binding = 0) uniform sampler2D SkyLUT;
+layout(binding = 1) uniform sampler3D FroxelLUT;
 
 vec3 WhitePointColorMapping(float exposure, in out vec3 color){
     const vec3 white_point = vec3(1.08241, 0.96756, 0.95003);
@@ -37,6 +38,10 @@ void main() {
     float v = 0.5 + 0.5 * sign(theta) * sqrt(abs(theta) / (PI / 2));
 
     vec3 sky_color = texture(SkyLUT, vec2(u, v)).rgb;
+
+    vec4 aerial_res = texture(FroxelLUT, vec3(iFragTexCoord.x, 1.0 - iFragTexCoord.y , 1.0)).rgba;
+
+    sky_color = aerial_res.rgb + sky_color * aerial_res.a;
 
     sky_color = WhitePointColorMapping(Exposure, sky_color);
 

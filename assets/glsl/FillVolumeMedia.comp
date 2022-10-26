@@ -34,7 +34,7 @@ struct VirtualInfoT{
 
 };
 
-layout(binding = 1, std140) uniform VirtualTextureTable{
+layout(binding = 2, std140) uniform VirtualTextureTable{
     VirtualInfoT VirtualInfo[MaxLocalVolumeN + 1];
 };
 
@@ -45,10 +45,11 @@ const int MaxVirtualTextureN = 2;
 
 layout(binding = 2) uniform sampler3D VirtualTextures[MaxVirtualTextureN];
 
-layout(binding = 2, std140) uniform Params{
+layout(binding = 3, std140) uniform Params{
     vec3 WorldOrigin;
     int SliceZCount;
     vec3 WorldShape;
+    int FillVolumeMedia;
     vec3 InvVirtualTextureShape;
     mat4 Proj;
     mat4 InvProj;
@@ -75,9 +76,9 @@ void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
 }
 
 bool Intersect(in vec3 pointPos, in vec3 aabbLow, in vec3 aabbHigh){
-    return pointPos.x >= aabbLow.x && pointPos.x <= aabbHigh.x
-        && pointPos.y >= aabbLow.y && pointPos.y <= aabbHigh.y
-        && pointPos.z >= aabbLow.z && pointPos.z <= aabbHigh.z;
+    return pointPos.x > aabbLow.x && pointPos.x < aabbHigh.x
+        && pointPos.y > aabbLow.y && pointPos.y < aabbHigh.y
+        && pointPos.z > aabbLow.z && pointPos.z < aabbHigh.z;
 }
 
 //readwrite
@@ -109,6 +110,15 @@ void main(){
                 ivec3 index = g_index *  BlockLen + ivec3(lx, ly, lz);
                 if(index.x >= res.x || index.y >= res.y || index.z >= res.z)
                     continue;
+
+                vec4 vbuffer0 = vec4(0), vbuffer1 = vec4(0);
+                vec4 rgba0, rgba1;
+
+                if(!bool(FillVolumeMedia)){
+                    imageStore(VBuffer0, index, vbuffer0);
+                    imageStore(VBuffer1, index, vbuffer1);
+                    continue;
+                }
 //                imageStore(VBuffer0, index, vec4(index, 1.0));
 //                imageStore(VBuffer1, g_index, vec4(g_index, 0.5));
 //                return;
@@ -117,13 +127,12 @@ void main(){
                 // clip coord -> world pos
                 vec2 clip_xy = (vec2(index.x + 0.5, index.y + 0.5) / res.xy - 0.5) * 2.0;
                 vec4 _clip = Proj * vec4(0.0, 0.0, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
-                float _clip_z = _clip.z / _clip.w * 0.5 + 0.5;
+                float _clip_z = _clip.z / _clip.w;// * 0.5 + 0.5;
                 vec4 view_xy = InvProj * vec4(clip_xy, _clip_z, 1.0);
                 vec4 view_pos = vec4(view_xy.xy/view_xy.w, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
                 vec4 world_pos = InvView * (view_pos);
                 vec3 grid_sample_pos = world_pos.xyz / world_pos.w;
-                vec4 vbuffer0 = vec4(0), vbuffer1 = vec4(0);
-                vec4 rgba0, rgba1;
+
                 // local volume
                 for(int i = 0; i < intersect_volume_count; ++i){
                     int UID = S_IntersectUID[i];
@@ -134,8 +143,8 @@ void main(){
 //                        offset = vec3(model * vec4(offset, 0));
                         offset = offset  / (S_GeometryInfo[UID].high - S_GeometryInfo[UID].low);
                         // query for virtual texture
-//                        VirtualSample(UID, offset, rgba0, rgba1);
-                        rgba0 = vec4(0.001, 0.0001, 0.0, 0.0001);
+                        VirtualSample(UID, offset, rgba0, rgba1);
+//                        rgba0 = vec4(0.001, 0.0001, 0.01, 0.0001);
                         vbuffer0 += rgba0;
                         vbuffer1 += rgba1;
 //                        return ;

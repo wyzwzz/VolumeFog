@@ -853,9 +853,10 @@ class VirtualTexMgr{
         auto tex_coord = free_blocks.front();
         free_blocks.pop();
 
+        const int pad = 1;
         auto pos = tex_coord.xyz() * block_length;
-        vpt.infos[uid].origin0 = vec4(pos.x, pos.y, pos.z, tex_coord.w);
-        vpt.infos[uid].shape0 = vec4(block_length, block_length, block_length, 0);
+        vpt.infos[uid].origin0 = vec4(pos.x + pad, pos.y + pad, pos.z + pad, tex_coord.w);
+        vpt.infos[uid].shape0 = vec4(block_length - 2 * pad, block_length - 2 * pad, block_length - 2 * pad, 0);
 
         virtual_textures[tex_coord.w]->set_texture_data(pos.x, pos.y, pos.z,
                                                         block_length, block_length, block_length,
@@ -865,8 +866,8 @@ class VirtualTexMgr{
         free_blocks.pop();
 
         pos = tex_coord.xyz() * block_length;
-        vpt.infos[uid].origin1 = vec4(pos.x, pos.y, pos.z, tex_coord.w);
-        vpt.infos[uid].shape1 = vec4(block_length, block_length, block_length, 0);
+        vpt.infos[uid].origin1 = vec4(pos.x + pad, pos.y + pad, pos.z + pad, tex_coord.w);
+        vpt.infos[uid].shape1 = vec4(block_length - 2 * pad, block_length - 2 * pad, block_length - 2 * pad, 0);
 
         virtual_textures[tex_coord.w]->set_texture_data(pos.x, pos.y, pos.z,
                                                         block_length, block_length, block_length,
@@ -881,6 +882,9 @@ class VirtualTexMgr{
     }
     const auto& getVirtualTextures() const {
         return virtual_textures;
+    }
+    vec3f get_inv_tex_shape() const{
+        return vec3f(1.f / tex_shape.x, 1.f / tex_shape.y, 1.f / tex_shape.z);
     }
   private:
     vec3i tex_shape;
@@ -1018,13 +1022,18 @@ class AerialLUTGenerator{
     }
 
     void prepare(const VirtualTexMgr& mgr){
-        mgr.getVPTBuffer()->bind(1);
+        mgr.getVPTBuffer()->bind(2);
         auto& texes = mgr.getVirtualTextures();
         const int unit_base = 2;
         int unit_offset = 0;
         for(auto& tex : texes){
             tex->bind(unit_base + unit_offset++);
         }
+        volume_params.inv_virtual_tex_shape = mgr.get_inv_tex_shape();
+    }
+
+    void set(bool fill_vol){
+        volume_params.fill_vol = fill_vol;
     }
 
     void generate(const Ref<texture2d_t>& trans_lut,
@@ -1037,15 +1046,18 @@ class AerialLUTGenerator{
 
         volume_params_buffer.set_buffer_data(&volume_params);
 
+
         c_fill_shader.bind();
 
         intersect_vol_uid_buffer.bind(0);
         intersect_geometry_buffer.bind(1);
-        volume_params_buffer.bind(2);
+        volume_params_buffer.bind(3);
+
+        GL_LinearRepeatSampler::Bind(2);
+        GL_LinearRepeatSampler::Bind(3);
 
         vbuffer0->bind_image(0, 0, GL_WRITE_ONLY, GL_RGBA32F);
         vbuffer1->bind_image(1, 0, GL_WRITE_ONLY, GL_RGBA32F);
-
 
         {
             int x = vbuffer_res.x / 4, y = vbuffer_res.y / 4, z = vbuffer_res.z / 4;
@@ -1059,9 +1071,7 @@ class AerialLUTGenerator{
             GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
         }
 
-
         c_fill_shader.unbind();
-
 
 
         c_calc_shader.bind();
@@ -1121,7 +1131,7 @@ class AerialLUTGenerator{
     struct alignas(16) VolumeParams{
         vec3 world_origin;
         int slice_z_count;
-        vec3 world_shape; int pad0;
+        vec3 world_shape; int fill_vol = 1;
         vec3 inv_virtual_tex_shape; int pad1;
         mat4 proj;
         mat4 inv_proj;
@@ -1265,7 +1275,7 @@ private:
             local_volume_test.vol0->info.high = vec3f(27.f, 35.f, 27.f);
             local_volume_test.vol0->info.uid = 1;
             local_volume_test.vol0->info.model = mat4::identity();
-            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(1.f, 1.f, 0.f, 1.f));
+            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(0.001f, 0.01f, 0.f, 0.0001));
             local_volume_test.vol0->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.5f));
 
             local_volume_test.debug_vol0cube = newRef<LocalVolumeCube>(local_volume_test.vol0->info);
@@ -1279,7 +1289,7 @@ private:
             local_volume_test.vol1->info.high = vec3f(-7.5f, 32.f, -7.f);
             local_volume_test.vol1->info.uid = 2;
             local_volume_test.vol1->info.model = mat4::identity();
-            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(1.f, 1.f, 1.f, 1.f));
+            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.01f, 0.01f, 0.01f, 0.0001f));
             local_volume_test.vol1->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, -0.5f));
 
             local_volume_test.debug_vol1cube = newRef<LocalVolumeCube>(local_volume_test.vol1->info);
@@ -1385,6 +1395,12 @@ private:
             bool update_aerial = false;
             if(ImGui::TreeNode("Aerial LUT")){
                 update_aerial |= ImGui::InputInt("Ray Marching Steps Per Slice", &ray_marching_steps_per_slice);
+                if(ImGui::RadioButton("Fill Volume Media", fill_vol)){
+                    fill_vol = !fill_vol;
+                    aerial_lut_generator.set(fill_vol);
+                }
+
+                ImGui::TreePop();
             }
 
             if(update_aerial){
@@ -1635,6 +1651,7 @@ private:
     AerialLUTGenerator aerial_lut_generator;
     vec3i aerial_lut_res = {320, 180, 192};
     int ray_marching_steps_per_slice = 2;
+    bool fill_vol = true;
 
     GBufferGenerator gbuffer_generator;
 

@@ -36,8 +36,8 @@ layout(std140, binding = 1) uniform AerialParams{
     int RayMarchingStepsPerSlice;
     vec3 ViewPos;
     int SliceZCount;
-
     mat4 SunProjView;
+    int FrameIndex;
 };
 
 layout(binding = 0) uniform sampler2D TransmittanceLUT;
@@ -181,12 +181,16 @@ void main(){
     vec3 sum_sigma_t = vec3(0);
     vec3 sum_in_scattering = vec3(0);
 
+
+    float jitter = fract((sin(FrameIndex + y * 12.9898 * 2) + cos(FrameIndex + x * 12.9898 * 2)) * 43758.5453);
+
     for(int z = 0; z < SliceZCount; ++z){
         float dt = (end_t - start_t) / RayMarchingStepsPerSlice;
         float t = start_t;
         for(int i = 0; i < RayMarchingStepsPerSlice; ++i){
-            float w = (z + 0.5f + float(i) / z) / SliceZCount;
-            float mid_t = t + dt * 0.5f;
+            float w = (z + 0.5f + float(i + jitter) / RayMarchingStepsPerSlice) / SliceZCount;
+            float next_t = t + dt;
+            float mid_t = mix(t, next_t, jitter);
             vec3 ith_pos = planet_view_pos + view_dir * mid_t;
             float ith_height = length(ith_pos) - GroundRadius;
             vec3 ith_sigma_s, ith_sigma_t;

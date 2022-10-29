@@ -3,6 +3,7 @@
 #include <unordered_set>
 #include <cyPoint.h>
 #include <cySampleElim.h>
+#include <fstream>
 
 /**
  * @param BA vertex B' pos minus vertex A' pos
@@ -72,11 +73,14 @@ void DestroyAllSampler(){
 struct Noise{
     inline static Ref<texture2d_t> BlueNoise;
 
+    inline static vec2i BlueNoiseRes;
+
     static void Init(){
         BlueNoise = newRef<texture2d_t>();
         BlueNoise->initialize_handle();
         auto bn = image2d_t<color4b>(load_rgba_from_file("assets/bluenoise.png"));
         BlueNoise->initialize_format_and_data(1, GL_RGBA8, bn);
+        BlueNoiseRes = bn.size();
     }
 
     static void Destroy(){
@@ -159,6 +163,34 @@ struct LocalVolume{
     image3d_t<vec4f> vbuffer1;
 };
 
+Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const std::string& desc_name){
+    std::ifstream fin(filename);
+    int width = 1, height = 1, depth = 1;
+    fin >> width >> height >> depth;
+
+    const int voxelCount = width * height * depth;
+    std::vector<vec4f> data(voxelCount);
+
+    for(int i = 0; i < voxelCount; ++i)
+    {
+        float x;
+        fin >> x;
+        data[i] = vec4f(x);
+    }
+    auto local_vol = newRef<LocalVolume>();
+    local_vol->desc_name = desc_name;
+    auto tmp = image3d_t<vec4f>(width, height, depth, data.data());
+    auto& dst = local_vol->vbuffer0;
+    dst.initialize(128, 128, 128);
+    for(int i = 0; i < depth; i++){
+        for(int j = 0; j < height; j++){
+            for(int k = 0; k < width; k++){
+                dst.at(k, j, i) = tmp.at(k, j, i);
+            }
+        }
+    }
+    return local_vol;
+}
 
 class TransmittanceGenerator{
   public:
@@ -685,6 +717,12 @@ class TerrainRenderer{
         terrain_params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
 
+    void resize(const vec2i& res){
+        terrain_params.blue_noise_uv_factor = vec2f((float)res.x / Noise::BlueNoiseRes.x,
+                                                    (float)res.y / Noise::BlueNoiseRes.y);
+        render_res = res;
+    }
+
     void set(const AtmosphereProperties& ap){
         atmos_prop_buffer.set_buffer_data(&ap);
     }
@@ -696,9 +734,11 @@ class TerrainRenderer{
         terrain_params.shadow_proj_view = sun_proj_view;
     }
 
-    void update(float max_aerial_dist, float world_scale){
+    void update(float max_aerial_dist, float world_scale, float jitter_radius){
         terrain_params.max_aerial_dist = max_aerial_dist;
         terrain_params.world_scale = world_scale;
+        terrain_params.jitter_factor = vec2f(jitter_radius / render_res.x,
+                                             jitter_radius / render_res.y);
     }
 
     void render(const Ref<texture2d_t>& transmittance_lut,
@@ -708,8 +748,10 @@ class TerrainRenderer{
                 const Ref<texture2d_t>& shadow_map,
                 const vec3f& view_pos,
                 const mat4& camera_proj_view){
+        static int frame_index = 0;
         terrain_params.view_pos = view_pos;
         terrain_params.camera_proj_view = camera_proj_view;
+        terrain_params.frame_index = ++frame_index;
         terrain_params_buffer.set_buffer_data(&terrain_params);
 
         transmittance_lut->bind(0);
@@ -742,12 +784,15 @@ class TerrainRenderer{
 
   private:
     program_t shader;
+    vec2i render_res;
     struct alignas(16) TerrainParams{
         vec3f sun_dir; float sun_theta;
         vec3f sun_radiance; float max_aerial_dist = 2000.f;
         vec3f view_pos; float world_scale = 50.f;
+        vec2f blue_noise_uv_factor; vec2f jitter_factor;
         mat4 shadow_proj_view;
         mat4 camera_proj_view;
+        int frame_index;
     }terrain_params;
     std140_uniform_block_buffer_t<TerrainParams> terrain_params_buffer;
     std140_uniform_block_buffer_t<AtmosphereProperties> atmos_prop_buffer;
@@ -1040,8 +1085,10 @@ class AerialLUTGenerator{
                   const Ref<texture2d_t>& multi_scat_lut,
                   const Ref<texture2d_t>& shadow_map,
                   const vec3& view_pos){
+        static int frame_index = 0;
         aerial_params.view_height = view_pos.y * 50.f;
         aerial_params.view_pos = view_pos;
+        aerial_params.frame_index = ++frame_index;
         aerial_params_buffer.set_buffer_data(&aerial_params);
 
         volume_params_buffer.set_buffer_data(&volume_params);
@@ -1149,6 +1196,7 @@ class AerialLUTGenerator{
         vec3 frustum_d; int ray_marching_steps_per_slice;
         vec3 view_pos;  int slice_z_count;
         mat4 sun_proj_view;
+        int frame_index;
     }aerial_params;
     std140_uniform_block_buffer_t<AerialParams> aerial_params_buffer;
 
@@ -1157,6 +1205,82 @@ class AerialLUTGenerator{
     Ref<texture3d_t> vbuffer1;
     Ref<texture3d_t> froxel_lut;
     vec3i vbuffer_res;
+};
+
+class Accumulator{
+  public:
+    void initialize(){
+        c_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/Accumulate.comp"));
+
+        pre = newRef<texture2d_t>();
+        pre->initialize_handle();
+
+        cur = newRef<texture2d_t>();
+        cur->initialize_handle();
+
+        params_buffer.initialize_handle();
+        params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+    }
+    void resize(const vec2i& _res){
+        if(res == _res){
+            return;
+        }
+        res = _res;
+        cur->destroy();
+        pre->destroy();
+        cur->initialize_handle();
+        pre->initialize_handle();
+
+        cur->initialize_texture(1, GL_RGBA8, res.x, res.y);
+        pre->initialize_texture(1, GL_RGBA8, res.x, res.y);
+    }
+    void setBlendFactor(float ratio){
+        params.blend_ratio = ratio;
+    }
+    void accumulate(const Ref<texture2d_t>& pre_gbuffer0,
+                    const Ref<texture2d_t>& cur_gbuffer0,
+                    const Ref<texture2d_t>& cur_color,
+                    const mat4& pre_proj_view){
+        params.pre_proj_view = pre_proj_view;
+        params_buffer.set_buffer_data(&params);
+
+        params_buffer.bind(0);
+        cur_gbuffer0->bind_image(0, 0, GL_READ_ONLY, GL_RGBA32F);
+        cur_color->bind_image(1, 0, GL_READ_ONLY, GL_RGBA8);
+        cur->bind_image(2, 0, GL_WRITE_ONLY, GL_RGBA8);
+
+        pre_gbuffer0->bind(0);
+        pre->bind(1);
+        GL_NearestRepeatSampler::Bind(0);
+        GL_NearestRepeatSampler::Bind(1);
+
+        c_shader.bind();
+
+        {
+            auto group_size = GetGroupSize(res.x, res.y, 1);
+            GL_EXPR(glDispatchCompute(group_size.x, group_size.y, 1));
+            GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
+        }
+
+        c_shader.unbind();
+
+        swap(pre, cur);
+    }
+    auto getColor() {
+        return cur;
+    }
+  private:
+    program_t c_shader;
+    vec2i res;
+    Ref<texture2d_t> pre;
+    Ref<texture2d_t> cur;
+    struct alignas(16) Params{
+        mat4 pre_proj_view;
+        float blend_ratio = 0.05;
+    }params;
+    std140_uniform_block_buffer_t<Params> params_buffer;
+
 };
 
 class PostProcessRenderer{
@@ -1247,15 +1371,24 @@ private:
 
         gbuffer_generator.initialize();
         gbuffer_generator.resize(window->get_window_size());
+        dummy_gbuffer_generator.initialize();
+        dummy_gbuffer_generator.resize(window->get_window_size());
+        gbuffer = &gbuffer_generator;
 
         dl_shadow_generator.initialize();
 
         terrain_renderer.initialize();
+        terrain_renderer.resize(window->get_window_size());
         terrain_renderer.set(std_unit_atmos_prop);
         terrain_renderer.update(sun_dir, sun_color * sun_intensity, _);
-        terrain_renderer.update(camera.get_far_z() * 50.f, 50.f);
+        terrain_renderer.update(camera.get_far_z() * 50.f, 50.f, jitter_radius);
 
         wireframe_renderer.initialize();
+
+
+        accumulator.initialize();
+        accumulator.resize(window->get_window_size());
+        accumulator.setBlendFactor(blend_ratio);
 
 
         post_process_renderer.initialize();
@@ -1271,11 +1404,11 @@ private:
         {
             local_volume_test.vol0 = newRef<LocalVolume>();
             local_volume_test.vol0->desc_name = "test_local_volume0";
-            local_volume_test.vol0->info.low = vec3f(0.f, 15.f, 0.f);
-            local_volume_test.vol0->info.high = vec3f(27.f, 35.f, 27.f);
+            local_volume_test.vol0->info.low = vec3f(0.f, 20.f, 0.f);
+            local_volume_test.vol0->info.high = vec3f(7.f, 25.f, 7.f);
             local_volume_test.vol0->info.uid = 1;
             local_volume_test.vol0->info.model = mat4::identity();
-            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(0.001f, 0.01f, 0.f, 0.0001));
+            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(0.0001f, 0.001f, 0.f, 0.001));
             local_volume_test.vol0->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.5f));
 
             local_volume_test.debug_vol0cube = newRef<LocalVolumeCube>(local_volume_test.vol0->info);
@@ -1285,11 +1418,11 @@ private:
 
             local_volume_test.vol1 = newRef<LocalVolume>();
             local_volume_test.vol1->desc_name = "test_local_volume1";
-            local_volume_test.vol1->info.low = vec3f(-24.5f, 15.f, -24.f);
-            local_volume_test.vol1->info.high = vec3f(-7.5f, 32.f, -7.f);
+            local_volume_test.vol1->info.low = vec3f(-14.5f, 20.f, -14.f);
+            local_volume_test.vol1->info.high = vec3f(-7.5f, 25.f, -7.f);
             local_volume_test.vol1->info.uid = 2;
             local_volume_test.vol1->info.model = mat4::identity();
-            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.01f, 0.01f, 0.01f, 0.0001f));
+            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.01f, 0.01f, 0.01f, 0.001f));
             local_volume_test.vol1->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, -0.5f));
 
             local_volume_test.debug_vol1cube = newRef<LocalVolumeCube>(local_volume_test.vol1->info);
@@ -1297,11 +1430,25 @@ private:
 
             ret = vtex_mgr.upload(local_volume_test.vol1);
             assert(ret);
+
+            local_volume_test.vol2 = LoadLocalVolumeFromTexFile("assets/density.txt", "cloud");
+            local_volume_test.vol2->info.low = vec3f(10.f, 20.f, 10.f);
+            local_volume_test.vol2->info.high = vec3f(15.f, 25.f, 15.f);
+            local_volume_test.vol2->info.uid = 3;
+            local_volume_test.vol2->info.model = mat4::identity();
+            local_volume_test.vol2->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.f));
+
+            local_volume_test.debug_vol2cube = newRef<LocalVolumeCube>(local_volume_test.vol2->info);
+
+            ret = vtex_mgr.upload(local_volume_test.vol2);
+            assert(ret);
         }
 
     }
 
 	void frame() override {
+        auto pre_proj_view = camera.get_view_proj();
+
         handle_events();
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.f);
@@ -1407,6 +1554,24 @@ private:
                 aerial_lut_generator.set(camera.get_far_z() * 50.f, true, ray_marching_steps_per_slice);
             }
 
+            bool update_terrain = false;
+            if(ImGui::TreeNode("Terrain")){
+                update_terrain |= ImGui::InputFloat("Jitter Radius", &jitter_radius);
+
+                ImGui::TreePop();
+            }
+            if(update_terrain){
+                terrain_renderer.update(camera.get_far_z() * 50.f, 50.f, jitter_radius);
+            }
+
+            if(ImGui::TreeNode("Accumulate")){
+                if(ImGui::SliderFloat("Blend Ratio", &blend_ratio, 0.f, 1.f)){
+                    accumulator.setBlendFactor(blend_ratio);
+                }
+
+                ImGui::TreePop();
+            }
+
         }
 
 
@@ -1418,7 +1583,8 @@ private:
 
         // render test local volume
         if(1){
-            std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1};
+            std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1,
+            local_volume_test.vol2};
             aerial_lut_generator.prepare(camera_proj, camera_view, visible_local_volumes);
 
             aerial_lut_generator.prepare(vtex_mgr);
@@ -1445,15 +1611,17 @@ private:
         dl_shadow_generator.end();
 
         // render terrian
+        auto pre_gbuffer = gbuffer;
+        gbuffer = gbuffer == &gbuffer_generator ? &dummy_gbuffer_generator : &gbuffer_generator;
 
-        gbuffer_generator.begin();
+        gbuffer->begin();
         for(auto& mesh : terrain_meshes){
-            gbuffer_generator.draw(mesh->vao, mesh->ebo.index_count(),
+            gbuffer->draw(mesh->vao, mesh->ebo.index_count(),
                                    mesh->t, camera_view, camera_proj,
                                    mesh->albedo_map, mesh->normal_map);
         }
-        gbuffer_generator.end();
-        auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
+        gbuffer->end();
+        auto [gbuffer0, gbuffer1] = gbuffer->getGBuffer();
 
         // todo
         bindToOffScreenFrame(true);
@@ -1465,11 +1633,9 @@ private:
                                 camera_proj_view);
 
 
-
         sky_lut_generator.generate(camera.get_position() * 50.f,
                                    trans_generator.getLUT(),
                                    multi_scat_generator.getLUT());
-
 
         auto camera_dir = camera.get_xyz_direction();
         const vec3f world_up = {0.f, 1.f, 0.f};
@@ -1494,9 +1660,14 @@ private:
         }
 
 
+        accumulator.accumulate(pre_gbuffer->getGBuffer().first,
+                               gbuffer->getGBuffer().first,
+                               offscreen_frame.color,
+                               pre_proj_view);
+
         framebuffer_t::bind_to_default();
         framebuffer_t::clear_color_depth_buffer();
-        post_process_renderer.draw(offscreen_frame.color);
+        post_process_renderer.draw(accumulator.getColor());
 
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1649,17 +1820,25 @@ private:
     VirtualTexMgr vtex_mgr;
 
     AerialLUTGenerator aerial_lut_generator;
-    vec3i aerial_lut_res = {320, 180, 192};
+    vec3i aerial_lut_res = {240, 180, 256};
     int ray_marching_steps_per_slice = 2;
     bool fill_vol = true;
 
     GBufferGenerator gbuffer_generator;
 
+    GBufferGenerator dummy_gbuffer_generator;
+
+    GBufferGenerator* gbuffer;
+
     DirectionalLightShadowGenerator dl_shadow_generator;
 
     TerrainRenderer terrain_renderer;
+    float jitter_radius = 5.f;
 
     WireFrameRenderer wireframe_renderer;
+
+    Accumulator accumulator;
+    float blend_ratio = 0.05f;
 
     PostProcessRenderer post_process_renderer;
 
@@ -1669,6 +1848,7 @@ private:
 
     float exposure = 10.f;
 
+    float world_scale = 50.f;
 
     // test and debug
     struct {
@@ -1676,6 +1856,9 @@ private:
         Ref<LocalVolumeCube> debug_vol0cube;
         Ref<LocalVolume> vol1;
         Ref<LocalVolumeCube> debug_vol1cube;
+
+        Ref<LocalVolume> vol2;
+        Ref<LocalVolumeCube> debug_vol2cube;
     }local_volume_test;
 
 };

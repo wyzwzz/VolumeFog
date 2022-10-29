@@ -32,12 +32,14 @@ layout(binding = 4) uniform sampler2D ShadowMap;
 layout(binding = 5) uniform sampler2D BlueNoiseMap;
 
 
-layout(binding = 1) uniform TerrianParams{
+layout(binding = 1, std140) uniform TerrianParams{
     vec3 SunDir; float SunTheta;
     vec3 SunRadiance; float MaxAerialDist;
     vec3 ViewPos; float WorldScale;
+    vec2 BlueNoiseUVFactor; vec2 JitterFactor;
     mat4 ShadowProjView;
     mat4 CameraProjView;
+    int FrameIndex;
 };
 
 vec3 decodeNormal(vec2 v)
@@ -109,8 +111,11 @@ void main(){
     vec4 ndc = CameraProjView * vec4(world_pos, 1.0);
     ndc.xyz /= ndc.w;
     vec3 clip_pos = ndc.xyz * vec3(0.5, -0.5, 0.5) + 0.5;
-    float z = 50.0 * distance(ViewPos, world_pos) / MaxAerialDist;
-    vec4 aerial_res = texture(FroxelLUT, vec3(clip_pos.xy, z));
+    float z = WorldScale * distance(ViewPos, world_pos) / MaxAerialDist;
+    vec2 bn_uv = clip_pos.xy * BlueNoiseUVFactor;
+    vec2 bn = texture(BlueNoiseMap, bn_uv).xy;
+    vec2 offset = JitterFactor * bn.x * vec2(cos(2 * PI * bn.y), sin(2 * PI * bn.y));
+    vec4 aerial_res = texture(FroxelLUT, vec3(clip_pos.xy + offset, z));
 
     vec3 in_scattering = aerial_res.rgb;
     float view_transmiitance = aerial_res.w;

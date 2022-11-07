@@ -115,7 +115,7 @@ void main(){
     vec2 bn_uv = clip_pos.xy * BlueNoiseUVFactor;
     vec2 bn = texture(BlueNoiseMap, bn_uv).xy;
     vec2 offset = JitterFactor * bn.x * vec2(cos(2 * PI * bn.y), sin(2 * PI * bn.y));
-    vec4 aerial_res = texture(FroxelLUT, vec3(clip_pos.xy + offset, z));
+    vec4 aerial_res = texture(FroxelLUT, vec3(clip_pos.xy , z));
 
     vec3 in_scattering = aerial_res.rgb;
     float view_transmiitance = aerial_res.w;

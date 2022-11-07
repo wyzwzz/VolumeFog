@@ -1,44 +1,79 @@
 #version 460 core
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
-layout(binding = 0, rgba32f) uniform readonly image2D CurGBuffer;
-layout(binding = 1, rgba8) uniform readonly image2D CurColor;
-layout(binding = 2, rgba8) uniform writeonly image2D CurAccColor;
 
-layout(binding = 0) uniform sampler2D PreGBuffer;
-layout(binding = 1) uniform sampler2D PreAccColor;
+layout(binding = 0, rgba32f) uniform writeonly image3D CurAccFroxelLUT;
 
+layout(binding = 0) uniform sampler3D PreAccFroxelLUT;
+layout(binding = 1) uniform sampler3D CurFoxelLUT;
 
 layout(binding = 0, std140) uniform Params{
-    mat4 PreProjView;
+    mat4 CurProj;
+    mat4 CurInvProj;
+    mat4 CurInvView;
+    mat4 PreMVP;
+    mat4 PreInvView;
     float BlendRatio;
+    int SliceZCount;
+    float CameraFarZ;
 };
 
+const int BlockLen = 4;
+const ivec3 BlockSize = ivec3(BlockLen, BlockLen, BlockLen);
+const ivec3 Offset[6] = {ivec3(-1, 0, 0), ivec3(1, 0, 0),
+                         ivec3(0, -1, 0), ivec3(0, 1, 0),
+                         ivec3(0, 0, -1), ivec3(0, 0, 1)};
 void main(){
-    ivec2 g_index = ivec2(gl_WorkGroupSize.xy * gl_WorkGroupID.xy + gl_LocalInvocationID.xy);
-    ivec2 res = imageSize(CurColor);
-    if (g_index.x >= res.x || g_index.y >= res.y){
-        return;
-    }
+    ivec3 res = imageSize(CurAccFroxelLUT);
+    res.z = SliceZCount;
+    ivec3 g_index = ivec3(gl_WorkGroupSize.xyz * gl_WorkGroupID.xyz + gl_LocalInvocationID.xyz);
+    ivec3 mres = res - 1;
+    for(int lz = 0; lz < BlockLen; ++lz){
+        for (int ly = 0; ly < BlockLen; ++ly){
+            for (int lx = 0; lx < BlockLen; ++lx){
+                ivec3 index = g_index *  BlockLen + ivec3(lx, ly, lz);
+                if (index.x >= res.x || index.y >= res.y || index.z >= res.z)
+                    continue;
+                vec3 cur_uvw = (vec3(index) + 0.5) / vec3(res);
+                vec4 cur_froxel = texture(CurFoxelLUT, cur_uvw);
 
+                //首先计算出当下帧每一个froxel对应的世界坐标，然后据此计算出在上一帧的uvw纹理坐标
+                //如果一个froxel可以重投影到上一帧的视锥体中，那么进行blend，否则直接使用当前的froxel
+                vec2 clip_xy = (vec2(index.x + 0.5, index.y + 0.5) / res.xy - 0.5) * 2.0;// -1 ~ 1
+                vec4 _clip = CurProj * vec4(0.0, 0.0, (index.z + 0.5) / SliceZCount * CameraFarZ, 1.0);
+                float _clip_z = _clip.z / _clip.w;// -1 ~ 1
+                vec4 view_xy = CurInvProj * vec4(clip_xy, _clip_z, 1.0);
+                vec4 view_pos = vec4(view_xy.xy / view_xy.w, (index.z + 0.5) / SliceZCount * CameraFarZ, 1.0);
+                vec4 world_pos = CurInvView * view_pos;
+                vec3 grid_sample_pos = world_pos.xyz / world_pos.w;
 
-    vec4 cur_color = imageLoad(CurColor, g_index).rgba;
+                vec4 pre_ndc_pos = PreMVP * vec4(grid_sample_pos, 1.0);
+                pre_ndc_pos.xyz /= pre_ndc_pos.w;
+                vec3 pre_uvw = pre_ndc_pos.xyz * 0.5 + 0.5;
 
-    if(cur_color.w == 0){
-        imageStore(CurAccColor, g_index, vec4(0));
-        return;
+                if(all(equal(clamp(pre_uvw, vec3(0), vec3(1)), pre_uvw))){
+//                    ivec3 pre_idx = ivec3(res.x * pre_uvw.x, res.y * pre_uvw.y, res.z * pre_uvw.z);
+//                    vec4 pre_froxel = imageLoad(PreAccFroxelLUT, pre_idx);
+                    vec3 pre_view_pos = PreInvView[3].xyz;
+                    vec3 pre_view_dir = PreInvView[2].xyz;
+                    float pre_view_z = dot(pre_view_dir, grid_sample_pos - pre_view_pos);
+                    float pre_z = pre_view_z / CameraFarZ;
+                    vec4 pre_froxel = texture(PreAccFroxelLUT, vec3(pre_uvw.xy, pre_z));
+                    //读取当前帧周围7个froxel的值
+                    vec4 aabb_min = cur_froxel;
+                    vec4 aabb_max = cur_froxel;
+                    for(int i = 0; i < 6; i++){
+                        ivec3 idx = clamp(index + Offset[i], ivec3(0, 0, 0), ivec3(mres));
+                        vec3 uvw = (vec3(idx) + 0.5) / vec3(res);
+                        vec4 froxel = texture(CurFoxelLUT, uvw);
+                        aabb_min = min(aabb_min, froxel);
+                        aabb_max = max(aabb_max, froxel);
+                    }
+                    pre_froxel = clamp(pre_froxel, aabb_min, aabb_max);
+                    cur_froxel = mix(pre_froxel, cur_froxel, BlendRatio);
+                }
+                imageStore(CurAccFroxelLUT, index, cur_froxel);
+            }
+        }
     }
-    vec3 pos = imageLoad(CurGBuffer, g_index).xyz;
-    vec4 pre_pos_clip = PreProjView * vec4(pos, 1.0);
-    vec2 pre_uv = pre_pos_clip.xy / pre_pos_clip.w * 0.5 + 0.5;
-    if (any(notEqual(clamp(pre_uv, vec2(0), vec2(1)), pre_uv))){
-        imageStore(CurAccColor, g_index, cur_color);
-        return;
-    }
-    vec4 accu_src = texture(PreAccColor, pre_uv);
-    vec3 pre_pos = texture(PreGBuffer, pre_uv).xyz;
-    float alpha = BlendRatio;
-    alpha *= exp(min(distance(pre_pos, pos), 1.0));
-    alpha = clamp(alpha, 0, 1);
-    imageStore(CurAccColor, g_index, mix(accu_src, cur_color, alpha));
 }

@@ -51,6 +51,7 @@ layout(binding = 3, std140) uniform Params{
     vec3 WorldShape;
     int FillVolumeMedia;
     vec3 InvVirtualTextureShape;
+    int FrameIndex;
     mat4 Proj;
     mat4 InvProj;
     mat4 InvView;
@@ -124,6 +125,7 @@ void main(){
 //                return;
 
                 //todo center + jitter + re-project and temporal blend
+                float jitter = fract((sin(FrameIndex + index.y * 12.9898 * 2) + cos(FrameIndex + index.x * 12.9898 * 2)) * (43758.5453 + index.z));
                 // clip coord -> world pos
                 vec2 clip_xy = (vec2(index.x + 0.5, index.y + 0.5) / res.xy - 0.5) * 2.0;
                 vec4 _clip = Proj * vec4(0.0, 0.0, (index.z + 0.5) / SliceZCount * 100.0, 1.0);

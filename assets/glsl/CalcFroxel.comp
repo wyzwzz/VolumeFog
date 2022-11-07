@@ -190,7 +190,7 @@ void main(){
         for(int i = 0; i < RayMarchingStepsPerSlice; ++i){
             float w = (z + 0.5f + float(i + jitter) / RayMarchingStepsPerSlice) / SliceZCount;
             float next_t = t + dt;
-            float mid_t = mix(t, next_t, jitter);
+            float mid_t = mix(t, next_t, 0.5);
             vec3 ith_pos = planet_view_pos + view_dir * mid_t;
             float ith_height = length(ith_pos) - GroundRadius;
             vec3 ith_sigma_s, ith_sigma_t;
@@ -202,8 +202,6 @@ void main(){
             ith_sigma_t += st.a;
 
             vec3 ith_trans = exp(-(sum_sigma_t + ith_sigma_t * dt * 0.5));
-
-
 
             // todo support other lights, point light
             // if is visiable with sun
@@ -223,7 +221,7 @@ void main(){
                 if(!in_shadow){
                     vec3 rho = EvalPhaseFunction(ith_height, u);
                     vec3 ith_sun_trans = GetTransmittance(ith_height, SunTheta);
-                    sum_in_scattering += ith_sun_trans * ith_sigma_s * rho * ith_sun_trans * dt;
+                    sum_in_scattering += ith_sun_trans * ith_sigma_s * rho * ith_trans * dt;
                 }
             }
             sum_in_scattering += GetMultiScattering(ith_height, SunTheta) * ith_sigma_s * ith_trans * dt;

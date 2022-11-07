@@ -185,7 +185,7 @@ Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const s
     for(int i = 0; i < depth; i++){
         for(int j = 0; j < height; j++){
             for(int k = 0; k < width; k++){
-                dst.at(k, j, i) = tmp.at(k, j, i);
+                dst.at(k, j, i) = tmp.at(k, j, i) * 0.01f;
             }
         }
     }
@@ -518,7 +518,9 @@ class DirectionalLightShadowGenerator{
         fbo.bind();
         GL_EXPR(glViewport(0, 0, ShadowMapSizeX, ShadowMapSizeY));
         GL_EXPR(glDrawBuffer(GL_COLOR_ATTACHMENT0));
+        GL_EXPR(glClearColor(1.f, 1.f, 1.f, 1.f));
         fbo.clear_color_depth_buffer();
+        GL_EXPR(glClearColor(0.f, 0.f, 0.f, 0.f));
     }
 
     void generate(const vertex_array_t& vao, int count,
@@ -1091,7 +1093,9 @@ class AerialLUTGenerator{
         aerial_params.frame_index = ++frame_index;
         aerial_params_buffer.set_buffer_data(&aerial_params);
 
+        volume_params.frame_index = frame_index;
         volume_params_buffer.set_buffer_data(&volume_params);
+
 
 
         c_fill_shader.bind();
@@ -1179,7 +1183,7 @@ class AerialLUTGenerator{
         vec3 world_origin;
         int slice_z_count;
         vec3 world_shape; int fill_vol = 1;
-        vec3 inv_virtual_tex_shape; int pad1;
+        vec3 inv_virtual_tex_shape; int frame_index = 0;
         mat4 proj;
         mat4 inv_proj;
         mat4 inv_view;
@@ -1207,77 +1211,91 @@ class AerialLUTGenerator{
     vec3i vbuffer_res;
 };
 
-class Accumulator{
+class FroxelAccumulator{
   public:
     void initialize(){
         c_shader = program_t::build_from(
             shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/Accumulate.comp"));
 
-        pre = newRef<texture2d_t>();
-        pre->initialize_handle();
-
-        cur = newRef<texture2d_t>();
-        cur->initialize_handle();
+        pre_acc = newRef<texture3d_t>();
+        cur_acc = newRef<texture3d_t>();
 
         params_buffer.initialize_handle();
         params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
-    void resize(const vec2i& _res){
+    void resize(const vec3i& _res){
         if(res == _res){
             return;
         }
         res = _res;
-        cur->destroy();
-        pre->destroy();
-        cur->initialize_handle();
-        pre->initialize_handle();
+        params.slice_z_count = res.z;
 
-        cur->initialize_texture(1, GL_RGBA8, res.x, res.y);
-        pre->initialize_texture(1, GL_RGBA8, res.x, res.y);
+        pre_acc->destroy();
+        cur_acc->destroy();
+
+        pre_acc->initialize_handle();
+        cur_acc->initialize_handle();
+
+        pre_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
+        cur_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
     }
-    void setBlendFactor(float ratio){
-        params.blend_ratio = ratio;
+    void set(float blend_ratio, float camera_far_z){
+        params.blend_ratio = blend_ratio;
+        params.camera_far_z = camera_far_z;
     }
-    void accumulate(const Ref<texture2d_t>& pre_gbuffer0,
-                    const Ref<texture2d_t>& cur_gbuffer0,
-                    const Ref<texture2d_t>& cur_color,
-                    const mat4& pre_proj_view){
-        params.pre_proj_view = pre_proj_view;
-        params_buffer.set_buffer_data(&params);
+    void accumulate(const Ref<texture3d_t>& froxel_lut,
+                    const mat4& pre_view,
+                    const mat4& pre_mvp,
+                    const mat4& cur_view,
+                    const mat4& cur_proj){
+            params.cur_proj = cur_proj;
+            params.cur_inv_proj = cur_proj.inverse();
+            params.cur_inv_view = cur_view.inverse();
+            params.pre_mvp = pre_mvp;
+            params.pre_inv_view = pre_view.inverse();
+            params_buffer.set_buffer_data(&params);
 
-        params_buffer.bind(0);
-        cur_gbuffer0->bind_image(0, 0, GL_READ_ONLY, GL_RGBA32F);
-        cur_color->bind_image(1, 0, GL_READ_ONLY, GL_RGBA8);
-        cur->bind_image(2, 0, GL_WRITE_ONLY, GL_RGBA8);
+            params_buffer.bind(0);
 
-        pre_gbuffer0->bind(0);
-        pre->bind(1);
-        GL_NearestRepeatSampler::Bind(0);
-        GL_NearestRepeatSampler::Bind(1);
+            pre_acc->bind(0);
+            GL_LinearClampSampler::Bind(0);
+            froxel_lut->bind(1);
+            GL_LinearClampSampler::Bind(1);
+            cur_acc->bind_image(0, 0, GL_WRITE_ONLY, GL_RGBA32F);
 
-        c_shader.bind();
+            c_shader.bind();
+            {
+                int x = res.x / 4, y = res.y / 4, z = res.z / 4;
+                constexpr int group_thread_size_x = 8;
+                constexpr int group_thread_size_y = 8;
+                constexpr int group_thread_size_z = 8;
+                const int group_size_x = (x + group_thread_size_x - 1) / group_thread_size_x;
+                const int group_size_y = (y + group_thread_size_y - 1) / group_thread_size_y;
+                const int group_size_z = (z + group_thread_size_z - 1) / group_thread_size_z;
+                GL_EXPR(glDispatchCompute(group_size_x, group_size_y, group_size_z));
+                GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
+            }
+            c_shader.unbind();
 
-        {
-            auto group_size = GetGroupSize(res.x, res.y, 1);
-            GL_EXPR(glDispatchCompute(group_size.x, group_size.y, 1));
-            GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
-        }
-
-        c_shader.unbind();
-
-        swap(pre, cur);
+            std::swap(pre_acc, cur_acc);
     }
-    auto getColor() {
-        return cur;
+    auto getLUT(){
+        return pre_acc;
     }
   private:
     program_t c_shader;
-    vec2i res;
-    Ref<texture2d_t> pre;
-    Ref<texture2d_t> cur;
+    vec3i res;
+    Ref<texture3d_t> pre_acc;
+    Ref<texture3d_t> cur_acc;
     struct alignas(16) Params{
-        mat4 pre_proj_view;
+        mat4 cur_proj;
+        mat4 cur_inv_proj;
+        mat4 cur_inv_view;
+        mat4 pre_mvp;
+        mat4 pre_inv_view;
         float blend_ratio = 0.05;
+        int slice_z_count;
+        float camera_far_z;
     }params;
     std140_uniform_block_buffer_t<Params> params_buffer;
 
@@ -1341,7 +1359,7 @@ private:
         offscreen_frame.fbo.attach(GL_DEPTH_STENCIL_ATTACHMENT, offscreen_frame.rbo);
         offscreen_frame.color = newRef<texture2d_t>();
         offscreen_frame.color->initialize_handle();
-        offscreen_frame.color->initialize_texture(1, GL_RGBA8, window_w, window_h);
+        offscreen_frame.color->initialize_texture(1, GL_RGBA32F, window_w, window_h);
         offscreen_frame.fbo.attach(GL_COLOR_ATTACHMENT0, *offscreen_frame.color);
         assert(offscreen_frame.fbo.is_complete());
 
@@ -1367,13 +1385,10 @@ private:
         aerial_lut_generator.resize(aerial_lut_res);
         aerial_lut_generator.set(std_unit_atmos_prop);
         aerial_lut_generator.set(sun_dir, _);
-        aerial_lut_generator.set(camera.get_far_z() * 50.f, true, 2);
+        aerial_lut_generator.set(camera.get_far_z() * world_scale, enable_volumetric_shadow, ray_marching_steps_per_slice);
 
         gbuffer_generator.initialize();
         gbuffer_generator.resize(window->get_window_size());
-        dummy_gbuffer_generator.initialize();
-        dummy_gbuffer_generator.resize(window->get_window_size());
-        gbuffer = &gbuffer_generator;
 
         dl_shadow_generator.initialize();
 
@@ -1386,9 +1401,9 @@ private:
         wireframe_renderer.initialize();
 
 
-        accumulator.initialize();
-        accumulator.resize(window->get_window_size());
-        accumulator.setBlendFactor(blend_ratio);
+        froxel_accumulator.initialize();
+        froxel_accumulator.resize(aerial_lut_res);
+        froxel_accumulator.set(blend_ratio, camera.get_far_z());
 
 
         post_process_renderer.initialize();
@@ -1432,8 +1447,8 @@ private:
             assert(ret);
 
             local_volume_test.vol2 = LoadLocalVolumeFromTexFile("assets/density.txt", "cloud");
-            local_volume_test.vol2->info.low = vec3f(10.f, 20.f, 10.f);
-            local_volume_test.vol2->info.high = vec3f(15.f, 25.f, 15.f);
+            local_volume_test.vol2->info.low = vec3f(10.f, 25.f, 10.f);
+            local_volume_test.vol2->info.high = vec3f(30.f, 45.f, 30.f);
             local_volume_test.vol2->info.uid = 3;
             local_volume_test.vol2->info.model = mat4::identity();
             local_volume_test.vol2->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.f));
@@ -1448,7 +1463,7 @@ private:
 
 	void frame() override {
         auto pre_proj_view = camera.get_view_proj();
-
+        auto pre_view = camera.get_view();
         handle_events();
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.f);
@@ -1546,12 +1561,13 @@ private:
                     fill_vol = !fill_vol;
                     aerial_lut_generator.set(fill_vol);
                 }
+                update_aerial |= ImGui::Checkbox("Enable Volumetric Shadow", &enable_volumetric_shadow);
 
                 ImGui::TreePop();
             }
 
             if(update_aerial){
-                aerial_lut_generator.set(camera.get_far_z() * 50.f, true, ray_marching_steps_per_slice);
+                aerial_lut_generator.set(camera.get_far_z() * world_scale, enable_volumetric_shadow, ray_marching_steps_per_slice);
             }
 
             bool update_terrain = false;
@@ -1564,9 +1580,9 @@ private:
                 terrain_renderer.update(camera.get_far_z() * 50.f, 50.f, jitter_radius);
             }
 
-            if(ImGui::TreeNode("Accumulate")){
+            if(ImGui::TreeNode("Foxel Accumulate")){
                 if(ImGui::SliderFloat("Blend Ratio", &blend_ratio, 0.f, 1.f)){
-                    accumulator.setBlendFactor(blend_ratio);
+                    froxel_accumulator.set(blend_ratio, camera.get_far_z());
                 }
 
                 ImGui::TreePop();
@@ -1594,9 +1610,11 @@ private:
                                           dl_shadow_generator.getShadowMap(),
                                           camera.get_position()
                                           );
-
-
-
+            froxel_accumulator.accumulate(aerial_lut_generator.getLUT(),
+                                          pre_view,
+                                          pre_proj_view,
+                                          camera_view,
+                                          camera_proj);
         }
 
         auto [sun_dir, sun_proj_view] = getSunLight();
@@ -1611,22 +1629,21 @@ private:
         dl_shadow_generator.end();
 
         // render terrian
-        auto pre_gbuffer = gbuffer;
-        gbuffer = gbuffer == &gbuffer_generator ? &dummy_gbuffer_generator : &gbuffer_generator;
 
-        gbuffer->begin();
+        gbuffer_generator.begin();
         for(auto& mesh : terrain_meshes){
-            gbuffer->draw(mesh->vao, mesh->ebo.index_count(),
+            gbuffer_generator.draw(mesh->vao, mesh->ebo.index_count(),
                                    mesh->t, camera_view, camera_proj,
                                    mesh->albedo_map, mesh->normal_map);
         }
-        gbuffer->end();
-        auto [gbuffer0, gbuffer1] = gbuffer->getGBuffer();
+        gbuffer_generator.end();
+
+        auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
 
         // todo
         bindToOffScreenFrame(true);
         terrain_renderer.render(trans_generator.getLUT(),
-                                aerial_lut_generator.getLUT(),
+                                froxel_accumulator.getLUT(),
                                 gbuffer0, gbuffer1,
                                 dl_shadow_generator.getShadowMap(),
                                 camera.get_position(),
@@ -1640,13 +1657,12 @@ private:
         auto camera_dir = camera.get_xyz_direction();
         const vec3f world_up = {0.f, 1.f, 0.f};
 
-
         bindToOffScreenFrame();
         GL_EXPR(glViewport(0, 0, window->get_window_width(), window->get_window_height()));
 
         sky_view_renderer.render(camera_dir, cross(camera_dir, world_up).normalized(), deg2rad(CameraFovDegree),
                                  sky_lut_generator.getLUT(),
-                                 aerial_lut_generator.getLUT());
+                                 froxel_accumulator.getLUT());
 
 
         {
@@ -1660,14 +1676,10 @@ private:
         }
 
 
-        accumulator.accumulate(pre_gbuffer->getGBuffer().first,
-                               gbuffer->getGBuffer().first,
-                               offscreen_frame.color,
-                               pre_proj_view);
 
         framebuffer_t::bind_to_default();
         framebuffer_t::clear_color_depth_buffer();
-        post_process_renderer.draw(accumulator.getColor());
+        post_process_renderer.draw(offscreen_frame.color);
 
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1747,7 +1759,7 @@ private:
         float sun_dir_x = std::cos(sun_y_rad) * std::cos(sun_x_rad);
         float sun_dir_z = std::cos(sun_y_rad) * std::sin(sun_x_rad);
         vec3f sun_dir = {sun_dir_x, sun_dir_y, sun_dir_z};
-        auto view = transform::look_at(sun_dir * 50.f, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f});
+        auto view = transform::look_at(sun_dir * 100.f, {0.f, 0.f, 0.f}, {0.f, 1.f, 0.f});
         auto proj = transform::orthographic(-50.f, 50.f, -50.f, 50.f, 1.f, 200.f);
         return std::make_tuple(-sun_dir, proj * view);
     }
@@ -1822,13 +1834,10 @@ private:
     AerialLUTGenerator aerial_lut_generator;
     vec3i aerial_lut_res = {240, 180, 256};
     int ray_marching_steps_per_slice = 2;
+    bool enable_volumetric_shadow = true;
     bool fill_vol = true;
 
     GBufferGenerator gbuffer_generator;
-
-    GBufferGenerator dummy_gbuffer_generator;
-
-    GBufferGenerator* gbuffer;
 
     DirectionalLightShadowGenerator dl_shadow_generator;
 
@@ -1837,7 +1846,7 @@ private:
 
     WireFrameRenderer wireframe_renderer;
 
-    Accumulator accumulator;
+    FroxelAccumulator froxel_accumulator;
     float blend_ratio = 0.05f;
 
     PostProcessRenderer post_process_renderer;

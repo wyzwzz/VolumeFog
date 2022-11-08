@@ -192,6 +192,15 @@ Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const s
     return local_vol;
 }
 
+Ref<texture2d_t> GenUniformGlobalFog(float start_height, float falloff_dist, float density){
+    const int tex_w = 512;
+    const int tex_h = 512;
+    auto tex = newRef<texture2d_t>();
+    tex->initialize_handle();
+    tex->initialize_format_and_data(1, GL_RGBA32F, image2d_t<vec4f>(tex_w, tex_h, vec4f(start_height, falloff_dist, density, 1.f)));
+    return tex;
+}
+
 class TransmittanceGenerator{
   public:
 
@@ -1078,9 +1087,16 @@ class AerialLUTGenerator{
         }
         volume_params.inv_virtual_tex_shape = mgr.get_inv_tex_shape();
     }
-
+    void prepare(const Ref<texture2d_t>& global_fog){
+        global_fog->bind(0);
+    }
     void set(bool fill_vol){
         volume_params.fill_vol = fill_vol;
+    }
+
+    void set(const vec3f& world_origin, const vec3f& world_shape){
+        volume_params.world_origin = world_origin;
+        volume_params.world_shape = world_shape;
     }
 
     void generate(const Ref<texture2d_t>& trans_lut,
@@ -1104,6 +1120,7 @@ class AerialLUTGenerator{
         intersect_geometry_buffer.bind(1);
         volume_params_buffer.bind(3);
 
+        GL_LinearClampSampler::Bind(0);
         GL_LinearRepeatSampler::Bind(2);
         GL_LinearRepeatSampler::Bind(3);
 
@@ -1386,6 +1403,7 @@ private:
         aerial_lut_generator.set(std_unit_atmos_prop);
         aerial_lut_generator.set(sun_dir, _);
         aerial_lut_generator.set(camera.get_far_z() * world_scale, enable_volumetric_shadow, ray_marching_steps_per_slice);
+        aerial_lut_generator.set(world_origin, world_shape);
 
         gbuffer_generator.initialize();
         gbuffer_generator.resize(window->get_window_size());
@@ -1457,7 +1475,14 @@ private:
 
             ret = vtex_mgr.upload(local_volume_test.vol2);
             assert(ret);
+
+            test_global_fog = GenUniformGlobalFog(0.f, 40.f, 0.0002f);
+            LocalVolumeGeometryInfo global_fog_info;
+            global_fog_info.low = world_origin;
+            global_fog_info.high = world_origin + world_shape;
+            test_global_fog_cube = newRef<LocalVolumeCube>(global_fog_info);
         }
+
 
     }
 
@@ -1605,6 +1630,8 @@ private:
 
             aerial_lut_generator.prepare(vtex_mgr);
 
+            aerial_lut_generator.prepare(test_global_fog);
+
             aerial_lut_generator.generate(trans_generator.getLUT(),
                                           multi_scat_generator.getLUT(),
                                           dl_shadow_generator.getShadowMap(),
@@ -1671,6 +1698,8 @@ private:
             wireframe_renderer.draw(local_volume_test.debug_vol0cube, vec4(1.f, 0.f, 0.f, 1.f), camera_proj_view);
 
             wireframe_renderer.draw(local_volume_test.debug_vol1cube, vec4(1.f, 1.f, 0.f, 1.f), camera_proj_view);
+
+            wireframe_renderer.draw(test_global_fog_cube, vec4(0.f, 1.f, 0.f, 1.f), camera_proj_view);
 
             wireframe_renderer.end();
         }
@@ -1772,10 +1801,6 @@ private:
         }
     }
 private:
-    // local volume fog
-    struct VirtualTexture{
-
-    };
 
     // sun light
     struct {
@@ -1858,7 +1883,8 @@ private:
     float exposure = 10.f;
 
     float world_scale = 50.f;
-
+    vec3f world_origin = vec3f(-30.f, 0.f, -30.f);
+    vec3f world_shape = vec3f(60.f);
     // test and debug
     struct {
         Ref<LocalVolume> vol0;
@@ -1869,7 +1895,8 @@ private:
         Ref<LocalVolume> vol2;
         Ref<LocalVolumeCube> debug_vol2cube;
     }local_volume_test;
-
+    Ref<texture2d_t> test_global_fog;
+    Ref<LocalVolumeCube> test_global_fog_cube;
 };
 
 

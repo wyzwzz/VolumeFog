@@ -38,7 +38,7 @@ layout(binding = 2, std140) uniform VirtualTextureTable{
     VirtualInfoT VirtualInfo[MaxLocalVolumeN + 1];
 };
 
-layout(binding = 0) uniform sampler2D GlobalFogTexture[2];
+layout(binding = 0) uniform sampler2D GlobalFogTexture;
 // global origin and shape
 
 const int MaxVirtualTextureN = 2;
@@ -59,10 +59,25 @@ layout(binding = 3, std140) uniform Params{
 
 void SampleGlobalVolume(in vec3 world_pos, out vec4 rgba0, out vec4 rgba1){
     vec3 sample_pos = (world_pos - WorldOrigin) / WorldShape;
-    // todo density remap with noise?
+    if(all(equal(clamp(sample_pos, vec3(0), vec3(1)), sample_pos))){
+        vec3 rgb = texture(GlobalFogTexture, sample_pos.xz).rgb;
+        if(world_pos.y < rgb.r){
+            rgba0 = vec4(0);
+        }
+        else if(world_pos.y < rgb.r + rgb.g){
+            rgba0 = vec4(vec3(rgb.b), 0.0);
+        }
+        else{
+            float density = exp(-(world_pos.y - rgb.r - rgb.g)) * rgb.b;
+            rgba0 = vec4(vec3(density), 0.0);
+        }
 
-    rgba0 = vec4(0);
-    rgba1 = vec4(0);
+        rgba1 = vec4(0);
+    }
+    else{
+        rgba0 = vec4(0);
+        rgba1 = vec4(0);
+    }
 }
 
 void VirtualSample(in int UID, in vec3 offset, out vec4 rgba0, out vec4 rgba1){
@@ -126,9 +141,10 @@ void main(){
 
                 //todo center + jitter + re-project and temporal blend
                 float jitter = fract((sin(FrameIndex + index.y * 12.9898 * 2) + cos(FrameIndex + index.x * 12.9898 * 2)) * (43758.5453 + index.z));
+                jitter = jitter * 0.5 + 0.25;
                 // clip coord -> world pos
-                vec2 clip_xy = (vec2(index.x + 0.5, index.y + 0.5) / res.xy - 0.5) * 2.0;
-                vec4 _clip = Proj * vec4(0.0, 0.0, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
+                vec2 clip_xy = (vec2(index.x + jitter, index.y + jitter) / res.xy - 0.5) * 2.0;
+                vec4 _clip = Proj * vec4(0.0, 0.0, (index.z + jitter) / SliceZCount * 100.0, 1.0);
                 float _clip_z = _clip.z / _clip.w;// * 0.5 + 0.5;
                 vec4 view_xy = InvProj * vec4(clip_xy, _clip_z, 1.0);
                 vec4 view_pos = vec4(view_xy.xy/view_xy.w, (index.z + 0.5) / SliceZCount * 100.0, 1.0);
@@ -153,9 +169,9 @@ void main(){
                     }
                 }
                 // global volume
-//                SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
-//                vbuffer0 += rgba0;
-//                vbuffer1 += rgba1;
+                SampleGlobalVolume(grid_sample_pos, rgba0, rgba1);
+                vbuffer0 += rgba0;
+                vbuffer1 += rgba1;
 //                imageStore(VBuffer0, index, vec4(index, 1.0));
 //                imageStore(VBuffer1, index, vec4(grid_sample_pos, 1.0));
                 imageStore(VBuffer0, index, vbuffer0);

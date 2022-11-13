@@ -29,6 +29,56 @@ inline vec3i GetGroupSize(int x, int y = 1, int z = 1) {
     const int group_size_z = (z + group_thread_size_z - 1) / group_thread_size_z;
     return {group_size_x, group_size_y, group_size_z};
 }
+
+#define PI wzz::math::PI_f
+
+
+struct Sphere {
+    std::vector<vec3f> positions;
+    std::vector<vec3f> normals;
+    std::vector<vec2f> uv;
+    std::vector<uint32_t> indices;
+};
+
+Sphere MakeSphere(int segcount = 64) {
+    uint32_t X_SEGMENTS = 64;
+    uint32_t Y_SEGMENTS = 64;
+
+    Sphere sphere;
+
+    for (uint32_t y = 0; y <= Y_SEGMENTS; y++) {
+        for (uint32_t x = 0; x <= X_SEGMENTS; x++) {
+            float x_segment = static_cast<float>(x) / X_SEGMENTS;
+            float y_segment = static_cast<float>(y) / Y_SEGMENTS;
+            float x_pos = std::cos(x_segment * 2.f * PI) * std::sin(y_segment * PI);
+            float y_pos = std::cos(y_segment * PI);
+            float z_pos = std::sin(x_segment * 2.f * PI) * std::sin(y_segment * PI);
+
+            sphere.positions.emplace_back(x_pos, y_pos, z_pos);
+            sphere.uv.emplace_back(x_segment, y_segment);
+            sphere.normals.emplace_back(x_pos, y_pos, z_pos);
+        }
+    }
+    //use GL_TRIANGLE_STRIP
+    bool odd_row = false;
+    for (uint32_t y = 0; y < Y_SEGMENTS; y++) {
+        if (!odd_row) {
+            for (uint32_t x = 0; x <= X_SEGMENTS; x++) {
+                sphere.indices.emplace_back(y * (X_SEGMENTS + 1) + x);
+                sphere.indices.emplace_back((y + 1) * (X_SEGMENTS + 1) + x);
+            }
+        } else {
+            for (int x = X_SEGMENTS; x >= 0; x--) {
+                sphere.indices.emplace_back((y + 1) * (X_SEGMENTS + 1) + x);
+                sphere.indices.emplace_back(y * (X_SEGMENTS + 1) + x);
+            }
+        }
+        odd_row = !odd_row;
+    }
+
+    return sphere;
+}
+
 template<GLint filter, GLint wrap>
 struct GLSampler{
     inline static sampler_t sampler;
@@ -126,6 +176,10 @@ struct LocalVolumeGeometryInfo{
     mat4 model;// not consider rotate current so it's just AABB now
 };
 
+struct DebugDraw{
+
+};
+
 struct LocalVolumeCube : public LocalVolumeGeometryInfo{
     explicit LocalVolumeCube(const LocalVolumeGeometryInfo& info)
     : LocalVolumeGeometryInfo(info)
@@ -200,6 +254,85 @@ Ref<texture2d_t> GenUniformGlobalFog(float start_height, float falloff_dist, flo
     tex->initialize_format_and_data(1, GL_RGBA32F, image2d_t<vec4f>(tex_w, tex_h, vec4f(start_height, falloff_dist, density, 1.f)));
     return tex;
 }
+enum LocalLightType : int{
+    UnKnown = 0,
+    Point_Light = 1,
+    Spot_Light = 2
+};
+struct alignas(16) LocalLightInfo{
+    vec3 center_pos;
+    int light_type;
+    vec3 light_dir;
+    float radius;
+    vec3 light_radiance;
+    float fade_cos_end;
+    vec3 ambient;
+    float fade_cos_beg;
+};
+
+struct LocalSpotLight{
+    LocalLightType light_type;
+    vec3 pos;
+    vec3 intensity;
+    vec3 ambient;
+    vec3 light_dir;
+    float light_half_angle;//degree
+    float light_near_z;
+    float light_far_z;
+
+    LocalLightInfo ConvertTo() const{
+        return {
+            .center_pos = pos,
+            .light_type = static_cast<int>(Spot_Light),
+            .light_dir = light_dir,
+            .radius = light_far_z,
+            .light_radiance = intensity,
+            .fade_cos_end = std::cos(wzz::math::deg2rad(light_half_angle)),
+            .ambient = ambient,
+            .fade_cos_beg = 1.f
+        };
+    }
+};
+
+struct LocalPointLight{
+    LocalLightType light_type;
+    vec3 pos;
+    vec3 intensity;
+    vec3 ambient;
+    float max_light_dist;
+
+    LocalLightInfo ConvertTo() const{
+        return {
+            .center_pos = pos,
+            .light_type = static_cast<int>(Point_Light),
+            .radius = max_light_dist,
+            .light_radiance = intensity,
+            .fade_cos_end = -1.f,
+            .ambient = ambient
+        };
+    }
+};
+
+struct LocalPointLightExt : LocalPointLight{
+    LocalPointLightExt(const LocalPointLight& light, float radius = 1.f)
+    :LocalPointLight(light)
+    {
+        auto sphere = MakeSphere();
+        vao.initialize_handle();
+        vbo.initialize_handle();
+        ebo.initialize_handle();
+        vbo.reinitialize_buffer_data(sphere.positions.data(), sphere.positions.size(), GL_STATIC_DRAW);
+        vao.bind_vertex_buffer_to_attrib(attrib_var_t<vec3f>(0), vbo, 0);
+        vao.enable_attrib(attrib_var_t<vec3f>(0));
+        ebo.reinitialize_buffer_data(sphere.indices.data(), sphere.indices.size(), GL_STATIC_DRAW);
+        vao.bind_index_buffer(ebo);
+        model = transform::translate(pos) * transform::scale(radius, radius, radius);
+    }
+    mat4 model = mat4::identity();
+    vertex_array_t vao;
+    vertex_buffer_t<vec3f> vbo;
+    index_buffer_t<uint32_t> ebo;
+};
 
 class TransmittanceGenerator{
   public:
@@ -662,6 +795,125 @@ class GBufferGenerator{
     std140_uniform_block_buffer_t<Transform> transform_buffer;
 };
 
+constexpr static int TileSize = 16;
+constexpr static int AvgLightsPerTile = 64;
+constexpr static int MaxLocalLightCount = 256;
+
+class LightCuller{
+  public:
+    struct alignas(16) LightArray{
+        LocalLightInfo local_light_infos[MaxLocalLightCount];
+    };
+
+    void initialize(){
+        c_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/CalcLightCull.comp")
+            );
+
+        light_index_list = newRef<texture2d_t>();
+        light_index_table = newRef<storage_buffer_t<uint32_t>>();
+
+        light_array = newRef<std140_uniform_block_buffer_t<LightArray>>();
+        light_array->initialize_handle();
+        light_array->reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+
+        light_index_count.initialize_handle();
+        light_index_count.initialize_buffer_data(nullptr, 1, GL_DYNAMIC_STORAGE_BIT);
+
+        params_buffer.initialize_handle();
+        params_buffer.reinitialize_buffer_data(nullptr, GL_DYNAMIC_DRAW);
+
+    }
+    void resize(vec2i framebuffer_res){
+        if(res == framebuffer_res) return;
+        res = framebuffer_res;
+        light_index_list->destroy();
+        light_index_table->destroy();
+
+        int x = (res.x + TileSize - 1) / TileSize;
+        int y = (res.y + TileSize - 1) / TileSize;
+        light_idx_list_res = {x, y};
+        light_index_list->initialize_handle();
+        light_index_list->initialize_texture(1, GL_RG16UI, x, y);
+
+        light_index_table->initialize_handle();
+        light_index_table->initialize_buffer_data(nullptr, x * y * AvgLightsPerTile, GL_DYNAMIC_STORAGE_BIT);
+    }
+    void add(const LocalLightInfo& info){
+        if(light_count >= MaxLocalLightCount){
+            throw std::runtime_error("Too many local lights");
+        }
+        lights.local_light_infos[light_count] = info;
+        light_array->set_buffer_data(&lights.local_light_infos[light_count], light_count * sizeof(LocalLightInfo), sizeof(LocalLightInfo));
+        light_count += 1;
+    }
+    void reset(){
+        light_count = 0;
+    }
+    void update(const fps_camera_t& camera){
+        auto proj_view = camera.get_view_proj();
+        frustum_extf frustum;
+        wzz::geometry::extract_frustum_from_matrix(proj_view, frustum, true);
+        params.frustum_corner0 = frustum.frustum_corners[0];
+        params.frustum_corner1 = frustum.frustum_corners[1];
+        params.frustum_corner2 = frustum.frustum_corners[2];
+        params.frustum_corner3 = frustum.frustum_corners[3];
+        params.frustum_corner4 = frustum.frustum_corners[4];
+        params.frustum_corner5 = frustum.frustum_corners[5];
+        params.frustum_corner6 = frustum.frustum_corners[6];
+        params.frustum_corner7 = frustum.frustum_corners[7];
+
+        params.light_count = light_count;
+        params_buffer.set_buffer_data(&params);
+    }
+    void cull(){
+        static uint32_t g_idx = 0;
+        light_index_count.set_buffer_data(&g_idx, 0, sizeof(uint32_t));
+
+        light_index_list->bind_image(0, 0, GL_WRITE_ONLY, GL_RG16UI);
+        light_index_table->bind(0);
+        light_index_count.bind(1);
+        light_array->bind(0);
+        params_buffer.bind(1);
+        c_shader.bind();
+
+        auto group_size = GetGroupSize(light_idx_list_res.x, light_idx_list_res.y);
+        GL_EXPR(glDispatchCompute(group_size.x, group_size.y, 1));
+
+        GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
+
+        c_shader.unbind();
+    }
+    auto get(){
+        return std::make_tuple(light_index_list, light_index_table, light_array);
+    }
+  private:
+    program_t c_shader;
+    vec2i res;
+    vec2i light_idx_list_res;
+    Ref<texture2d_t> light_index_list;
+
+    Ref<storage_buffer_t<uint32_t>> light_index_table;
+
+    storage_buffer_t<uint32_t> light_index_count;
+
+    LightArray lights;
+    int light_count = 0;
+    Ref<std140_uniform_block_buffer_t<LightArray>> light_array;
+
+    struct alignas(16) Params{
+        vec3 frustum_corner0; float pad0;
+        vec3 frustum_corner1; float pad1;
+        vec3 frustum_corner2; float pad2;
+        vec3 frustum_corner3; float pad3;
+        vec3 frustum_corner4; float pad4;
+        vec3 frustum_corner5; float pad5;
+        vec3 frustum_corner6; float pad6;
+        vec3 frustum_corner7; float pad7;
+        int light_count;
+    }params;
+    std140_uniform_block_buffer_t<Params> params_buffer;
+};
 
 class WireFrameRenderer{
   public:
@@ -673,6 +925,7 @@ class WireFrameRenderer{
         params_buffer.initialize_handle();
         params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
+
     void begin(){
         shader.bind();
         GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_LINE));
@@ -700,6 +953,30 @@ class WireFrameRenderer{
         GL_EXPR(glEnable(GL_DEPTH_TEST));
     }
 
+    void begin2(){
+        shader.bind();
+        GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_LINE));
+//        GL_EXPR(glDisable(GL_DEPTH_TEST));
+    }
+    void draw(const Ref<LocalPointLightExt>& light_cube,
+              const vec4& color,
+              const mat4& proj_view){
+        params.mvp = proj_view * light_cube->model;
+        params.line_color = color;
+        params_buffer.set_buffer_data(&params);
+        params_buffer.bind(0);
+
+        light_cube->vao.bind();
+
+        GL_EXPR(glDrawElements(GL_TRIANGLES, light_cube->ebo.index_count(), GL_UNSIGNED_INT, nullptr));
+
+        light_cube->vao.unbind();
+    }
+    void end2(){
+        shader.unbind();
+        GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_FILL));
+//        GL_EXPR(glEnable(GL_DEPTH_TEST));
+    }
   private:
     program_t shader;
 
@@ -751,7 +1028,12 @@ class TerrainRenderer{
         terrain_params.jitter_factor = vec2f(jitter_radius / render_res.x,
                                              jitter_radius / render_res.y);
     }
-
+    void bind(const Ref<texture2d_t>& light_index_list, const Ref<storage_buffer_t<uint32_t>>& light_index_table,
+              const Ref<std140_uniform_block_buffer_t<LightCuller::LightArray>>& light_array){
+        light_index_list->bind_image(0, 0, GL_READ_ONLY, GL_RG16UI);
+        light_index_table->bind(0);
+        light_array->bind(2);
+    }
     void render(const Ref<texture2d_t>& transmittance_lut,
                 const Ref<texture3d_t>& froxel_lut,
                 const Ref<texture2d_t>& gbuffer0,
@@ -1099,20 +1381,12 @@ class AerialLUTGenerator{
         volume_params.world_shape = world_shape;
     }
 
-    void generate(const Ref<texture2d_t>& trans_lut,
-                  const Ref<texture2d_t>& multi_scat_lut,
-                  const Ref<texture2d_t>& shadow_map,
-                  const vec3& view_pos){
+    void fill(){
         static int frame_index = 0;
-        aerial_params.view_height = view_pos.y * 50.f;
-        aerial_params.view_pos = view_pos;
-        aerial_params.frame_index = ++frame_index;
-        aerial_params_buffer.set_buffer_data(&aerial_params);
-
         volume_params.frame_index = frame_index;
         volume_params_buffer.set_buffer_data(&volume_params);
 
-
+        aerial_params.frame_index = ++frame_index;
 
         c_fill_shader.bind();
 
@@ -1140,6 +1414,23 @@ class AerialLUTGenerator{
         }
 
         c_fill_shader.unbind();
+    }
+    void bind(const Ref<texture2d_t>& light_index_list, const Ref<storage_buffer_t<uint32_t>>& light_index_table,
+              const Ref<std140_uniform_block_buffer_t<LightCuller::LightArray>>& light_array){
+        light_index_list->bind_image(1, 0, GL_READ_ONLY, GL_RG16UI);
+        light_index_table->bind(0);
+        light_array->bind(2);
+    }
+    void generate(const Ref<texture2d_t>& trans_lut,
+                  const Ref<texture2d_t>& multi_scat_lut,
+                  const Ref<texture2d_t>& shadow_map,
+                  const vec3& view_pos){
+
+        aerial_params.view_height = view_pos.y * 50.f;
+        aerial_params.view_pos = view_pos;
+        aerial_params_buffer.set_buffer_data(&aerial_params);
+
+
 
 
         c_calc_shader.bind();
@@ -1410,6 +1701,9 @@ private:
 
         dl_shadow_generator.initialize();
 
+        light_culler.initialize();
+        light_culler.resize(window->get_window_size());
+
         terrain_renderer.initialize();
         terrain_renderer.resize(window->get_window_size());
         terrain_renderer.set(std_unit_atmos_prop);
@@ -1483,7 +1777,43 @@ private:
             test_global_fog_cube = newRef<LocalVolumeCube>(global_fog_info);
         }
 
+        // init test local point light
+        {
+            LocalPointLight local_point_light0;
+            local_point_light0.light_type = Point_Light;
+            local_point_light0.pos = {20.f, 33.f, 15.f};
+            local_point_light0.intensity = {20.f, 0.2f, 0.1f};
+            local_point_light0.ambient = {0.0f, 0.0f, 0.0f};
+            local_point_light0.max_light_dist = 10.f;
+            local_point_light_test.point_light0 = newRef<LocalPointLightExt>(local_point_light0,
+                                                                             local_point_light0.max_light_dist);
 
+            light_culler.add(local_point_light_test.point_light0->ConvertTo());
+
+            LocalPointLight local_point_light1;
+            local_point_light1.light_type = Point_Light;
+            local_point_light1.pos = {20.f, 35.f, 13.f};
+            local_point_light1.intensity = {0.2f, 20.f, 0.1f};
+            local_point_light1.ambient = {0.0f, 0.0f, 0.0f};
+            local_point_light1.max_light_dist = 10.f;
+            local_point_light_test.point_light1 = newRef<LocalPointLightExt>(local_point_light1,
+                                                                             local_point_light1.max_light_dist);
+
+            light_culler.add(local_point_light_test.point_light1->ConvertTo());
+
+
+            LocalPointLight local_point_light2;
+            local_point_light2.light_type = Point_Light;
+            local_point_light2.pos = {16.f, 30.f, 12.f};
+            local_point_light2.intensity = {0.2f, 0.1f, 20.f};
+            local_point_light2.ambient = {0.0f, 0.0f, 0.0f};
+            local_point_light2.max_light_dist = 10.f;
+            local_point_light_test.point_light2 = newRef<LocalPointLightExt>(local_point_light2,
+                                                                             local_point_light2.max_light_dist);
+
+            light_culler.add(local_point_light_test.point_light2->ConvertTo());
+
+        }
     }
 
 	void frame() override {
@@ -1491,15 +1821,23 @@ private:
         auto pre_view = camera.get_view();
         handle_events();
 
+        auto camera_pos = camera.get_position();
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.f);
         if(ImGui::Begin("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)){
             ImGui::Text("Press LCtrl to show/hide cursor");
             ImGui::Text("Use W/A/S/D/Space/LShift to move");
             ImGui::Text("FPS: %.0f", ImGui::GetIO().Framerate);
+            ImGui::Text("Camera Pos: %.f %.f %.f", camera_pos.x, camera_pos.y, camera_pos.z);
             if (ImGui::Checkbox("VSync", &vsync)) {
                 window->set_vsync(vsync);
             }
 
+            if(ImGui::TreeNode("Debug Settings")){
+                ImGui::Checkbox("Draw Local Fog Volume Debug Cube", &draw_debug_local_fog_cube);
+                ImGui::Checkbox("Draw Local Point Light Debug Cube", &draw_debug_local_point_light_cube);
+
+                ImGui::TreePop();
+            }
 
             if(ImGui::TreeNode("Atmosphere Properties")){
                 bool update = false;
@@ -1622,6 +1960,14 @@ private:
         auto camera_proj = camera.get_proj();
         // get intersected volume proxy aabb
 
+        // light cull
+        light_culler.update(camera);
+
+        light_culler.cull();
+
+        auto [light_index_list, light_index_table, light_array] = light_culler.get();
+
+
         // render test local volume
         if(1){
             std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1,
@@ -1631,6 +1977,10 @@ private:
             aerial_lut_generator.prepare(vtex_mgr);
 
             aerial_lut_generator.prepare(test_global_fog);
+
+            aerial_lut_generator.fill();
+
+            aerial_lut_generator.bind(light_index_list, light_index_table, light_array);
 
             aerial_lut_generator.generate(trans_generator.getLUT(),
                                           multi_scat_generator.getLUT(),
@@ -1669,6 +2019,7 @@ private:
 
         // todo
         bindToOffScreenFrame(true);
+        terrain_renderer.bind(light_index_list, light_index_table, light_array);
         terrain_renderer.render(trans_generator.getLUT(),
                                 froxel_accumulator.getLUT(),
                                 gbuffer0, gbuffer1,
@@ -1692,7 +2043,25 @@ private:
                                  froxel_accumulator.getLUT());
 
 
-        {
+        if(draw_debug_local_point_light_cube){
+            wireframe_renderer.begin2();
+
+            wireframe_renderer.draw(local_point_light_test.point_light0,
+                                    vec4f(local_point_light_test.point_light0->intensity, 1.f),
+                                    camera_proj_view);
+
+            wireframe_renderer.draw(local_point_light_test.point_light1,
+                                    vec4f(local_point_light_test.point_light1->intensity, 1.f),
+                                    camera_proj_view);
+
+            wireframe_renderer.draw(local_point_light_test.point_light2,
+                                    vec4f(local_point_light_test.point_light2->intensity, 1.f),
+                                    camera_proj_view);
+
+            wireframe_renderer.end2();
+        }
+
+        if(draw_debug_local_fog_cube){
             wireframe_renderer.begin();
 
             wireframe_renderer.draw(local_volume_test.debug_vol0cube, vec4(1.f, 0.f, 0.f, 1.f), camera_proj_view);
@@ -1857,14 +2226,18 @@ private:
     VirtualTexMgr vtex_mgr;
 
     AerialLUTGenerator aerial_lut_generator;
-    vec3i aerial_lut_res = {240, 180, 256};
+    vec3i aerial_lut_res = {240, 180, 196};
     int ray_marching_steps_per_slice = 2;
     bool enable_volumetric_shadow = true;
     bool fill_vol = true;
+    bool draw_debug_local_fog_cube = true;
+    bool draw_debug_local_point_light_cube = true;
 
     GBufferGenerator gbuffer_generator;
 
     DirectionalLightShadowGenerator dl_shadow_generator;
+
+    LightCuller light_culler;
 
     TerrainRenderer terrain_renderer;
     float jitter_radius = 5.f;
@@ -1886,6 +2259,7 @@ private:
     vec3f world_origin = vec3f(-30.f, 0.f, -30.f);
     vec3f world_shape = vec3f(60.f);
     // test and debug
+    // local volume fog test
     struct {
         Ref<LocalVolume> vol0;
         Ref<LocalVolumeCube> debug_vol0cube;
@@ -1895,8 +2269,19 @@ private:
         Ref<LocalVolume> vol2;
         Ref<LocalVolumeCube> debug_vol2cube;
     }local_volume_test;
+    // global volume fog test
     Ref<texture2d_t> test_global_fog;
     Ref<LocalVolumeCube> test_global_fog_cube;
+    // local point light test
+    struct{
+        Ref<LocalPointLightExt> point_light0;
+
+        Ref<LocalPointLightExt> point_light1;
+
+        Ref<LocalPointLightExt> point_light2;
+
+    }local_point_light_test;
+
 };
 
 

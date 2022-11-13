@@ -1,6 +1,8 @@
 #version 460 core
 
 #define PI 3.14159265
+#define PointLightFlag 1
+#define SpotLightFlag  2
 
 layout(location = 0) in vec2 iUV;
 
@@ -31,7 +33,6 @@ layout(binding = 3) uniform sampler2D GBuffer1;
 layout(binding = 4) uniform sampler2D ShadowMap;
 layout(binding = 5) uniform sampler2D BlueNoiseMap;
 
-
 layout(binding = 1, std140) uniform TerrianParams{
     vec3 SunDir; float SunTheta;
     vec3 SunRadiance; float MaxAerialDist;
@@ -40,6 +41,32 @@ layout(binding = 1, std140) uniform TerrianParams{
     mat4 ShadowProjView;
     mat4 CameraProjView;
     int FrameIndex;
+};
+
+const int TileSize = 16;
+const int AvgLightsPerTile = 64;
+const int MaxLocalLightCount = 256;
+
+layout(binding = 0, rg16ui) uniform readonly uimage2D LightIndexList;
+
+layout(binding = 0, std430) buffer LightIndexTable{
+    uint LightIndex[];// AvgLightPerTile * TileCount * 2
+};
+
+struct LocalLightT{
+    vec3 center_pos;
+    int light_type;
+    vec3 light_dir;//for spot light
+    float radius;
+    vec3 light_radiance;
+    float fade_cos_end;
+    vec3 ambient;
+    float fade_cos_beg;
+};
+
+// 场景中所有的光源信息
+layout(binding = 2, std140) uniform LightArray{
+    LocalLightT LocalLights[MaxLocalLightCount];
 };
 
 vec3 decodeNormal(vec2 v)
@@ -51,6 +78,20 @@ vec3 decodeNormal(vec2 v)
 
     return normalize( nor );
 }
+
+#define A 2.51
+#define B 0.03
+#define C 2.43
+#define D 0.59
+#define E 0.14
+
+vec3 tonemap(vec3 x)
+{
+    vec3 v = x * 10.0;
+    return (v * (A * v + B)) / (v * (C * v + D) + E);
+}
+
+
 
 vec3 PostProcessColor(vec3 color)
 {
@@ -96,6 +137,22 @@ vec3 GetTransmittance(float h, float theta){
     return texture(TransmittanceLUT, uv).rgb;
 }
 
+vec3 calcLocalLightShading(uint light_index, in vec3 pos, in vec3 normal, in vec3 albedo){
+    LocalLightT light = LocalLights[light_index];
+
+    vec3 light_to_pos = pos - light.center_pos;
+    float dist2 = dot(light_to_pos, light_to_pos);
+    if(dist2 > light.radius * light.radius) return vec3(0);
+    vec3 atten_radiance = light.light_radiance / dist2;
+    light_to_pos = normalize(light_to_pos);
+
+    float cos_theta = dot(light_to_pos, light.light_dir);
+    float fade_factor = (cos_theta - light.fade_cos_end) / (light.fade_cos_beg - light.fade_cos_end);
+    fade_factor = pow(clamp(fade_factor, 0, 1), 3);
+
+    return (fade_factor * atten_radiance * max(dot(normal, - light_to_pos), 0.0) + light.ambient) * albedo;
+}
+
 void main(){
     vec4 p0 = texture(GBuffer0, iUV);
     vec4 p1 = texture(GBuffer1, iUV);
@@ -133,12 +190,27 @@ void main(){
         shadow_factor = float(test_z - 0.01  <= shadow_z);
     }
 
+    // 计算出所属的tile index
+    // 因为GBuffer的res和framebuffer是一样的 这里可以使用传入的iUV乘以其res来得到离散的像素坐标
+    ivec2 res = textureSize(GBuffer0, 0);
+    // iUV: 0 ~ 1 map to 0.5 ~ res - 0.5
+    ivec2 coord = ivec2(vec2(0.5) + (res - vec2(1)) * iUV);
+    ivec2 tile_index = coord / ivec2(TileSize);
+    uvec2 idx_ = imageLoad(LightIndexList, tile_index).rg;
+    uint idx_beg = LightIndex[idx_.x];
+    uint idx_end = idx_beg + idx_.y;
+    vec3 local_light_radiance = vec3(0);
+    for(uint idx = idx_beg; idx < idx_end; idx++){
+        local_light_radiance += calcLocalLightShading(idx, world_pos, normal, albedo);
+    }
+
     vec3 color = SunRadiance * (
         in_scattering +
         shadow_factor * sun_transmittance * albedo * max(0, dot(normal, -SunDir) * view_transmiitance)
     );
 
-    color = PostProcessColor(color);
+    local_light_radiance = pow(tonemap(local_light_radiance), vec3(1.0 / 2.2));
+    color = PostProcessColor(color);// + local_light_radiance;
 
     gl_FragDepth = clip_pos.z;
     oFragColor = vec4(color, 1.0);

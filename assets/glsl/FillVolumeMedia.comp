@@ -55,6 +55,7 @@ layout(binding = 3, std140) uniform Params{
     mat4 Proj;
     mat4 InvProj;
     mat4 InvView;
+    //todo camera_far_z
 };
 
 void SampleGlobalVolume(in vec3 world_pos, out vec4 rgba0, out vec4 rgba1){

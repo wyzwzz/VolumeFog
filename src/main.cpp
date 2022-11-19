@@ -711,6 +711,7 @@ class GBufferGenerator{
             shader_t<GL_FRAGMENT_SHADER>::from_file("assets/glsl/GBuffer.frag"));
 
         gbuffer0 = newRef<texture2d_t>();
+        pre_gbuffer0 = newRef<texture2d_t>();
         gbuffer1 = newRef<texture2d_t>();
 
         transform_buffer.initialize_handle();
@@ -725,6 +726,10 @@ class GBufferGenerator{
         gbuffer0->destroy();
         gbuffer0->initialize_handle();
         gbuffer0->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+
+        pre_gbuffer0->destroy();
+        pre_gbuffer0->initialize_handle();
+        pre_gbuffer0->initialize_texture(1, GL_RGBA32F, res.x, res.y);
 
         gbuffer1->destroy();
         gbuffer1->initialize_handle();
@@ -743,6 +748,7 @@ class GBufferGenerator{
     void begin(){
         shader.bind();
         fbo.bind();
+        fbo.attach(GL_COLOR_ATTACHMENT0, *gbuffer0);
         GL_EXPR(glViewport(0, 0, gbuffer_res.x, gbuffer_res.y));
         static GLenum draw_buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
         GL_EXPR(glDrawBuffers(2, draw_buffers));
@@ -770,10 +776,16 @@ class GBufferGenerator{
     void end(){
         fbo.unbind();
         shader.unbind();
+        std::swap(pre_gbuffer0, gbuffer0);
     }
 
     auto getGBuffer() const {
-        return std::make_pair(gbuffer0, gbuffer1);
+        return std::make_pair(pre_gbuffer0, gbuffer1);
+    }
+
+    auto getPreGBuffer() {
+
+        return gbuffer0;
     }
 
   private:
@@ -781,6 +793,7 @@ class GBufferGenerator{
     struct{
         // compress, pos(3) + normal(2) + albedo(2) + depth(1) = 2 * rgba
         Ref<texture2d_t> gbuffer0;
+        Ref<texture2d_t> pre_gbuffer0;
         Ref<texture2d_t> gbuffer1;
         vec2i gbuffer_res;
 
@@ -1609,6 +1622,83 @@ class FroxelAccumulator{
 
 };
 
+class TAA{
+  public:
+    void initialize(){
+        c_shader = program_t::build_from(
+            shader_t<GL_COMPUTE_SHADER>::from_file("assets/glsl/TAA.comp"));
+
+        pre_acc = newRef<texture2d_t>();
+        cur_acc = newRef<texture2d_t>();
+
+        params_buffer.initialize_handle();
+        params_buffer.reinitialize_buffer_data(nullptr, GL_DYNAMIC_DRAW);
+    }
+    void resize(vec2i res_){
+        if(res == res_) return;
+        res = res_;
+
+        pre_acc->destroy();
+        cur_acc->destroy();
+        //这里还是先用rgba32f
+        pre_acc->initialize_handle();
+        pre_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+
+        cur_acc->initialize_handle();
+        cur_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y);
+    }
+    void set(float blend_ratio, float dist_ratio){
+        params.blend_ratio = blend_ratio;
+        params.dist_ratio = dist_ratio;
+    }
+    void accumulate(const Ref<texture2d_t>& cur_color,
+                    const Ref<texture2d_t>& cur_gbuffer,
+                    const Ref<texture2d_t>& pre_gbuffer,
+                    const mat4& pre_proj_view){
+        params.pre_proj_view = pre_proj_view;
+        params_buffer.set_buffer_data(&params);
+
+        c_shader.bind();
+        params_buffer.bind(0);
+
+        cur_acc->bind_image(0, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        cur_color->bind_image(1, 0, GL_READ_ONLY, GL_RGBA32F);
+        cur_gbuffer->bind_image(2, 0, GL_READ_ONLY, GL_RGBA32F);
+        pre_gbuffer->bind_image(3, 0 ,GL_READ_ONLY, GL_RGBA32F);
+
+        pre_acc->bind(0);
+//        pre_gbuffer->bind(1);
+        GL_NearestClampSampler::Bind(0);
+//        GL_NearestClampSampler::Bind(1);
+
+        {
+            auto group_size = GetGroupSize(res.x, res.y, 1);
+            GL_EXPR(glDispatchCompute(group_size.x, group_size.y, 1));
+            GL_EXPR(glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT));
+        }
+
+        c_shader.unbind();
+
+        std::swap(pre_acc, cur_acc);
+    }
+    auto get() const {
+        return pre_acc;
+    }
+  private:
+    program_t c_shader;
+    vec2i res;
+
+    Ref<texture2d_t> pre_acc;
+    Ref<texture2d_t> cur_acc;
+
+    struct alignas(16) Params{
+        mat4 pre_proj_view;
+        float blend_ratio = 0.05f;
+        float dist_ratio = 1.f;
+    }params;
+    std140_uniform_block_buffer_t<Params> params_buffer;
+};
+
 class PostProcessRenderer{
   public:
     void initialize() {
@@ -1717,6 +1807,9 @@ private:
         froxel_accumulator.resize(aerial_lut_res);
         froxel_accumulator.set(blend_ratio, camera.get_far_z());
 
+        taa.initialize();
+        taa.resize(window->get_window_size());
+        taa.set(taa_blend_ratio, taa_exp_dist_ratio);
 
         post_process_renderer.initialize();
 
@@ -1950,6 +2043,14 @@ private:
 
                 ImGui::TreePop();
             }
+            if(ImGui::TreeNode("TAA")){
+                bool update = false;
+                update |= ImGui::SliderFloat("Blend Ration", &taa_blend_ratio, 0.f, 1.f);
+                update |= ImGui::SliderFloat("Dist Ration", &taa_exp_dist_ratio, 1.f, 10.f);
+                if(update) taa.set(taa_blend_ratio, taa_exp_dist_ratio);
+
+                ImGui::TreePop();
+            }
 
         }
 
@@ -2016,6 +2117,7 @@ private:
         gbuffer_generator.end();
 
         auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
+        auto pre_gubuffer0 = gbuffer_generator.getPreGBuffer();
 
         // todo
         bindToOffScreenFrame(true);
@@ -2074,10 +2176,12 @@ private:
         }
 
 
+        taa.accumulate(offscreen_frame.color, gbuffer0, pre_gubuffer0, pre_proj_view);
 
         framebuffer_t::bind_to_default();
         framebuffer_t::clear_color_depth_buffer();
-        post_process_renderer.draw(offscreen_frame.color);
+        post_process_renderer.draw(taa.get());
+//        post_process_renderer.draw(offscreen_frame.color);
 
         ImGui::End();
         ImGui::PopStyleVar();
@@ -2246,6 +2350,10 @@ private:
 
     FroxelAccumulator froxel_accumulator;
     float blend_ratio = 0.05f;
+
+    TAA taa;
+    float taa_blend_ratio = 1.f;
+    float taa_exp_dist_ratio = 1.f;
 
     PostProcessRenderer post_process_renderer;
 

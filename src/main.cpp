@@ -30,9 +30,6 @@ inline vec3i GetGroupSize(int x, int y = 1, int z = 1) {
     return {group_size_x, group_size_y, group_size_z};
 }
 
-#define PI wzz::math::PI_f
-
-
 struct Sphere {
     std::vector<vec3f> positions;
     std::vector<vec3f> normals;
@@ -140,7 +137,6 @@ struct Noise{
 
 };
 
-
 std::vector<vec2f> GetPoissonDiskSamples(int count) {
     std::default_random_engine rng{std::random_device()()};
     std::uniform_real_distribution<float> dis(0, 1);
@@ -217,7 +213,8 @@ struct LocalVolume{
     image3d_t<vec4f> vbuffer1;
 };
 
-Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const std::string& desc_name){
+Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const std::string& desc_name,
+                                            vec4f color = vec4f(1.f)){
     std::ifstream fin(filename);
     int width = 1, height = 1, depth = 1;
     fin >> width >> height >> depth;
@@ -239,7 +236,7 @@ Ref<LocalVolume> LoadLocalVolumeFromTexFile(const std::string& filename, const s
     for(int i = 0; i < depth; i++){
         for(int j = 0; j < height; j++){
             for(int k = 0; k < width; k++){
-                dst.at(k, j, i) = tmp.at(k, j, i) * 0.01f;
+                dst.at(k, j, i) = tmp.at(k, j, i) * 0.01f * color;
             }
         }
     }
@@ -254,11 +251,13 @@ Ref<texture2d_t> GenUniformGlobalFog(float start_height, float falloff_dist, flo
     tex->initialize_format_and_data(1, GL_RGBA32F, image2d_t<vec4f>(tex_w, tex_h, vec4f(start_height, falloff_dist, density, 1.f)));
     return tex;
 }
+
 enum LocalLightType : int{
     UnKnown = 0,
     Point_Light = 1,
     Spot_Light = 2
 };
+
 struct alignas(16) LocalLightInfo{
     vec3 center_pos;
     int light_type;
@@ -486,6 +485,7 @@ class SkyLUTGenerator{
         linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
     }
+
     void resize(const vec2i& lut_size){
         if(lut_size == prev_lut_size) return;
         prev_lut_size = lut_size;
@@ -493,9 +493,11 @@ class SkyLUTGenerator{
         sky_lut->initialize_handle();
         sky_lut->initialize_texture(1, GL_RGBA32F, lut_size.x, lut_size.y);
     }
+
     void set(const AtmosphereProperties& ap){
         atmos_prop_buffer.set_buffer_data(&ap);
     }
+
     void update(const vec3f& sun_dir, const vec3f& sun_radiance, int ray_marching_steps, bool multi_scattering){
         sky_params.sun_dir = sun_dir;
         sky_params.sun_radiance = sun_radiance;
@@ -503,6 +505,7 @@ class SkyLUTGenerator{
         sky_params.enable_multi_scattering = static_cast<int>(multi_scattering);
         sky_params_buffer.set_buffer_data(&sky_params);
     }
+
     void generate(const vec3f& view_pos,
                   const Ref<texture2d_t>& trans_lut,
                   const Ref<texture2d_t>& multi_scat_lut){
@@ -531,6 +534,7 @@ class SkyLUTGenerator{
 
         c_shader.unbind();
     }
+
     Ref<texture2d_t> getLUT(){
         return sky_lut;
     }
@@ -568,21 +572,14 @@ class SkyViewRenderer{
         sky_view_params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
         sky_view_per_frame_params_buffer.initialize_handle();
         sky_view_per_frame_params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
-
-//        linear_clamp_sampler.initialize_handle();
-//        linear_clamp_sampler.set_param(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-//        linear_clamp_sampler.set_param(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-//        linear_clamp_sampler.set_param(GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-
-
     }
+
     void update(float exposure, float w_over_h){
         sky_view_params.exposure = exposure;
         sky_view_params.w_over_h = w_over_h;
         sky_view_params_buffer.set_buffer_data(&sky_view_params);
     }
+
     // call it before bind to default framebuffer and view port
     void render(const vec3f& view_dir, const vec3f& view_right,
                 float view_fov_rad,
@@ -852,6 +849,7 @@ class LightCuller{
         light_index_table->initialize_handle();
         light_index_table->initialize_buffer_data(nullptr, x * y * AvgLightsPerTile, GL_DYNAMIC_STORAGE_BIT);
     }
+
     void add(const LocalLightInfo& info){
         if(light_count >= MaxLocalLightCount){
             throw std::runtime_error("Too many local lights");
@@ -860,9 +858,11 @@ class LightCuller{
         light_array->set_buffer_data(&lights.local_light_infos[light_count], light_count * sizeof(LocalLightInfo), sizeof(LocalLightInfo));
         light_count += 1;
     }
+
     void reset(){
         light_count = 0;
     }
+
     void update(const fps_camera_t& camera){
         auto proj_view = camera.get_view_proj();
         frustum_extf frustum;
@@ -879,6 +879,7 @@ class LightCuller{
         params.light_count = light_count;
         params_buffer.set_buffer_data(&params);
     }
+
     void cull(){
         static uint32_t g_idx = 0;
         light_index_count.set_buffer_data(&g_idx, 0, sizeof(uint32_t));
@@ -897,9 +898,11 @@ class LightCuller{
 
         c_shader.unbind();
     }
+
     auto get(){
         return std::make_tuple(light_index_list, light_index_table, light_array);
     }
+
   private:
     program_t c_shader;
     vec2i res;
@@ -971,6 +974,7 @@ class WireFrameRenderer{
         GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_LINE));
 //        GL_EXPR(glDisable(GL_DEPTH_TEST));
     }
+
     void draw(const Ref<LocalPointLightExt>& light_cube,
               const vec4& color,
               const mat4& proj_view){
@@ -985,11 +989,13 @@ class WireFrameRenderer{
 
         light_cube->vao.unbind();
     }
+
     void end2(){
         shader.unbind();
         GL_EXPR(glPolygonMode(GL_FRONT_AND_BACK, GL_FILL));
 //        GL_EXPR(glEnable(GL_DEPTH_TEST));
     }
+
   private:
     program_t shader;
 
@@ -1041,12 +1047,14 @@ class TerrainRenderer{
         terrain_params.jitter_factor = vec2f(jitter_radius / render_res.x,
                                              jitter_radius / render_res.y);
     }
+
     void bind(const Ref<texture2d_t>& light_index_list, const Ref<storage_buffer_t<uint32_t>>& light_index_table,
               const Ref<std140_uniform_block_buffer_t<LightCuller::LightArray>>& light_array){
         light_index_list->bind_image(0, 0, GL_READ_ONLY, GL_RG16UI);
         light_index_table->bind(0);
         light_array->bind(2);
     }
+
     void render(const Ref<texture2d_t>& transmittance_lut,
                 const Ref<texture3d_t>& froxel_lut,
                 const Ref<texture2d_t>& gbuffer0,
@@ -1228,15 +1236,19 @@ class VirtualTexMgr{
 
         return true;
     }
+
     auto getVPTBuffer() const {
         return vpt_buffer;
     }
+
     const auto& getVirtualTextures() const {
         return virtual_textures;
     }
+
     vec3f get_inv_tex_shape() const{
         return vec3f(1.f / tex_shape.x, 1.f / tex_shape.y, 1.f / tex_shape.z);
     }
+
   private:
     vec3i tex_shape;
     int tex_num;
@@ -1253,9 +1265,7 @@ class VirtualTexMgr{
     std::queue<vec4i> free_blocks;
     std::unordered_set<int> used_vol_set;
 
-
     std::vector<Ref<texture3d_t>> virtual_textures;
-
 };
 
 //填充froxel属性并计算累积值 包括大气散射、局部雾和全局雾
@@ -1292,6 +1302,7 @@ class AerialLUTGenerator{
         vbuffer_res = res;
         vbuffer0->destroy();
         vbuffer1->destroy();
+        froxel_lut->destroy();
 
         vbuffer0->initialize_handle();
         vbuffer0->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
@@ -1302,9 +1313,13 @@ class AerialLUTGenerator{
         froxel_lut->initialize_handle();
         froxel_lut->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
 
-        atmos_prop_buffer.initialize_handle();
-        atmos_prop_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
-
+        static bool init = true;
+        if(init)
+        {
+            atmos_prop_buffer.initialize_handle();
+            atmos_prop_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
+            init = false;
+        }
         aerial_params.slice_z_count = res.z;
         volume_params.slice_z_count = res.z;
     }
@@ -1382,9 +1397,11 @@ class AerialLUTGenerator{
         }
         volume_params.inv_virtual_tex_shape = mgr.get_inv_tex_shape();
     }
+
     void prepare(const Ref<texture2d_t>& global_fog){
         global_fog->bind(0);
     }
+
     void set(bool fill_vol){
         volume_params.fill_vol = fill_vol;
     }
@@ -1428,12 +1445,14 @@ class AerialLUTGenerator{
 
         c_fill_shader.unbind();
     }
+
     void bind(const Ref<texture2d_t>& light_index_list, const Ref<storage_buffer_t<uint32_t>>& light_index_table,
               const Ref<std140_uniform_block_buffer_t<LightCuller::LightArray>>& light_array){
         light_index_list->bind_image(1, 0, GL_READ_ONLY, GL_RG16UI);
         light_index_table->bind(0);
         light_array->bind(2);
     }
+
     void generate(const Ref<texture2d_t>& trans_lut,
                   const Ref<texture2d_t>& multi_scat_lut,
                   const Ref<texture2d_t>& shadow_map,
@@ -1473,9 +1492,7 @@ class AerialLUTGenerator{
         }
 
         c_calc_shader.unbind();
-
     }
-
 
     auto getLUT() const{
         return froxel_lut;
@@ -1544,6 +1561,7 @@ class FroxelAccumulator{
         params_buffer.initialize_handle();
         params_buffer.reinitialize_buffer_data(nullptr, GL_STATIC_DRAW);
     }
+
     void resize(const vec3i& _res){
         if(res == _res){
             return;
@@ -1560,10 +1578,12 @@ class FroxelAccumulator{
         pre_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
         cur_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y, res.z);
     }
+
     void set(float blend_ratio, float camera_far_z){
         params.blend_ratio = blend_ratio;
         params.camera_far_z = camera_far_z;
     }
+
     void accumulate(const Ref<texture3d_t>& froxel_lut,
                     const mat4& pre_view,
                     const mat4& pre_mvp,
@@ -1600,6 +1620,7 @@ class FroxelAccumulator{
 
             std::swap(pre_acc, cur_acc);
     }
+
     auto getLUT(){
         return pre_acc;
     }
@@ -1634,6 +1655,7 @@ class TAA{
         params_buffer.initialize_handle();
         params_buffer.reinitialize_buffer_data(nullptr, GL_DYNAMIC_DRAW);
     }
+
     void resize(vec2i res_){
         if(res == res_) return;
         res = res_;
@@ -1647,10 +1669,12 @@ class TAA{
         cur_acc->initialize_handle();
         cur_acc->initialize_texture(1, GL_RGBA32F, res.x, res.y);
     }
+
     void set(float blend_ratio, float dist_ratio){
         params.blend_ratio = blend_ratio;
         params.dist_ratio = dist_ratio;
     }
+
     void accumulate(const Ref<texture2d_t>& cur_color,
                     const Ref<texture2d_t>& cur_gbuffer,
                     const Ref<texture2d_t>& pre_gbuffer,
@@ -1681,6 +1705,7 @@ class TAA{
 
         std::swap(pre_acc, cur_acc);
     }
+
     auto get() const {
         return pre_acc;
     }
@@ -1822,13 +1847,12 @@ private:
         const int vds = 128;
         vtex_mgr.initialize(2, {512, 512, 512}, vds);
         {
-            local_volume_test.vol0 = newRef<LocalVolume>();
-            local_volume_test.vol0->desc_name = "test_local_volume0";
-            local_volume_test.vol0->info.low = vec3f(0.f, 20.f, 0.f);
-            local_volume_test.vol0->info.high = vec3f(7.f, 25.f, 7.f);
+            local_volume_test.vol0 = LoadLocalVolumeFromTexFile("assets/density.txt", "cloud0", vec4f(1.f,1.f,0.f,1.f));
+            local_volume_test.vol0->info.low = vec3f(-7.f, 20.f, -7.f);
+            local_volume_test.vol0->info.high = vec3f(7.f, 45.f, 7.f);
             local_volume_test.vol0->info.uid = 1;
             local_volume_test.vol0->info.model = mat4::identity();
-            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(0.0001f, 0.001f, 0.f, 0.001));
+//            local_volume_test.vol0->vbuffer0 = image3d_t<vec4f>(128, 128, 128, vec4f(0.0001f, 0.001f, 0.f, 0.001));
             local_volume_test.vol0->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, 0.5f));
 
             local_volume_test.debug_vol0cube = newRef<LocalVolumeCube>(local_volume_test.vol0->info);
@@ -1836,13 +1860,12 @@ private:
             auto ret = vtex_mgr.upload(local_volume_test.vol0);
             assert(ret);
 
-            local_volume_test.vol1 = newRef<LocalVolume>();
-            local_volume_test.vol1->desc_name = "test_local_volume1";
-            local_volume_test.vol1->info.low = vec3f(-14.5f, 20.f, -14.f);
-            local_volume_test.vol1->info.high = vec3f(-7.5f, 25.f, -7.f);
+            local_volume_test.vol1 = LoadLocalVolumeFromTexFile("assets/density.txt", "cloud1",vec4f(0.2f,0.5f,1.f,1.f));
+            local_volume_test.vol1->info.low = vec3f(-4.5f, 20.f, -4.5f);
+            local_volume_test.vol1->info.high = vec3f(17.5f, 45.f, 17.f);
             local_volume_test.vol1->info.uid = 2;
             local_volume_test.vol1->info.model = mat4::identity();
-            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.01f, 0.01f, 0.01f, 0.001f));
+//            local_volume_test.vol1->vbuffer0 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.01f, 0.01f, 0.01f, 0.001f));
             local_volume_test.vol1->vbuffer1 = image3d_t<vec4f>(vds, vds, vds, vec4f(0.f, 0.f, 0.f, -0.5f));
 
             local_volume_test.debug_vol1cube = newRef<LocalVolumeCube>(local_volume_test.vol1->info);
@@ -2012,6 +2035,9 @@ private:
 
             bool update_aerial = false;
             if(ImGui::TreeNode("Aerial LUT")){
+                if(ImGui::InputInt3("Aerial LUT Size", &aerial_lut_res.x)){
+                    aerial_lut_generator.resize(aerial_lut_res);
+                }
                 update_aerial |= ImGui::InputInt("Ray Marching Steps Per Slice", &ray_marching_steps_per_slice);
                 if(ImGui::RadioButton("Fill Volume Media", fill_vol)){
                     fill_vol = !fill_vol;
@@ -2044,6 +2070,7 @@ private:
                 ImGui::TreePop();
             }
             if(ImGui::TreeNode("TAA")){
+                ImGui::Checkbox("Enable TAA", &enable_taa);
                 bool update = false;
                 update |= ImGui::SliderFloat("Blend Ration", &taa_blend_ratio, 0.f, 1.f);
                 update |= ImGui::SliderFloat("Dist Ration", &taa_exp_dist_ratio, 1.f, 10.f);
@@ -2053,7 +2080,6 @@ private:
             }
 
         }
-
 
         // get camera frustum
         auto camera_proj_view = camera.get_view_proj();
@@ -2069,8 +2095,8 @@ private:
         auto [light_index_list, light_index_table, light_array] = light_culler.get();
 
 
-        // render test local volume
-        if(1){
+        // render local volume
+        {
             std::vector<Ref<LocalVolume>> visible_local_volumes = {local_volume_test.vol0, local_volume_test.vol1,
             local_volume_test.vol2};
             aerial_lut_generator.prepare(camera_proj, camera_view, visible_local_volumes);
@@ -2119,11 +2145,10 @@ private:
         auto [gbuffer0, gbuffer1] = gbuffer_generator.getGBuffer();
         auto pre_gubuffer0 = gbuffer_generator.getPreGBuffer();
 
-        // todo
         bindToOffScreenFrame(true);
         terrain_renderer.bind(light_index_list, light_index_table, light_array);
         terrain_renderer.render(trans_generator.getLUT(),
-                                froxel_accumulator.getLUT(),
+                                enable_taa ? froxel_accumulator.getLUT() : aerial_lut_generator.getLUT(),
                                 gbuffer0, gbuffer1,
                                 dl_shadow_generator.getShadowMap(),
                                 camera.get_position(),
@@ -2142,7 +2167,7 @@ private:
 
         sky_view_renderer.render(camera_dir, cross(camera_dir, world_up).normalized(), deg2rad(CameraFovDegree),
                                  sky_lut_generator.getLUT(),
-                                 froxel_accumulator.getLUT());
+                                 enable_taa ? froxel_accumulator.getLUT() : aerial_lut_generator.getLUT());
 
 
         if(draw_debug_local_point_light_cube){
@@ -2175,13 +2200,15 @@ private:
             wireframe_renderer.end();
         }
 
-
-        taa.accumulate(offscreen_frame.color, gbuffer0, pre_gubuffer0, pre_proj_view);
+        if(enable_taa)
+            taa.accumulate(offscreen_frame.color, gbuffer0, pre_gubuffer0, pre_proj_view);
 
         framebuffer_t::bind_to_default();
         framebuffer_t::clear_color_depth_buffer();
-        post_process_renderer.draw(taa.get());
-//        post_process_renderer.draw(offscreen_frame.color);
+        if(enable_taa)
+            post_process_renderer.draw(taa.get());
+        else
+            post_process_renderer.draw(offscreen_frame.color);
 
         ImGui::End();
         ImGui::PopStyleVar();
@@ -2265,6 +2292,7 @@ private:
         auto proj = transform::orthographic(-50.f, 50.f, -50.f, 50.f, 1.f, 200.f);
         return std::make_tuple(-sun_dir, proj * view);
     }
+
     void bindToOffScreenFrame(bool clear = false){
         offscreen_frame.fbo.bind();
         GL_EXPR(glDrawBuffer(GL_COLOR_ATTACHMENT0));
@@ -2278,7 +2306,7 @@ private:
     // sun light
     struct {
         float sun_x_degree = 0.f;
-        float sun_y_degree = 30.f;
+        float sun_y_degree = 7.f;
         float sun_intensity = 1.f;
         vec3f sun_color = vec3(1.f, 1.f, 1.f);
     };
@@ -2334,8 +2362,8 @@ private:
     int ray_marching_steps_per_slice = 2;
     bool enable_volumetric_shadow = true;
     bool fill_vol = true;
-    bool draw_debug_local_fog_cube = true;
-    bool draw_debug_local_point_light_cube = true;
+    bool draw_debug_local_fog_cube = false;
+    bool draw_debug_local_point_light_cube = false;
 
     GBufferGenerator gbuffer_generator;
 
@@ -2352,6 +2380,7 @@ private:
     float blend_ratio = 0.05f;
 
     TAA taa;
+    bool enable_taa = true;
     float taa_blend_ratio = 1.f;
     float taa_exp_dist_ratio = 1.f;
 
@@ -2391,7 +2420,6 @@ private:
     }local_point_light_test;
 
 };
-
 
 int main(){
     SET_LOG_LEVEL_DEBUG

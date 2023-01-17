@@ -13,7 +13,7 @@ using namespace wzz::math;
 using namespace wzz::gl;
 
 
-
+#define PI wzz::math::PI_f
 
 struct alignas(16) AtmosphereProperties {
     vec3f rayleigh_scattering = {5.802f, 13.558f, 33.1f};//10^(-6)m^(-1)
